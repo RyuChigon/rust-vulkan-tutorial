@@ -1,7 +1,11 @@
 mod debug;
 mod swapchain_properties;
 
-use std::ffi::CStr;
+use std::{
+    ffi::CStr,
+    fs::File,
+    io::{Cursor, Read},
+};
 
 use ash::{
     Device, Instance,
@@ -125,6 +129,8 @@ impl VulkanApp {
 
         let swapchain_image_views =
             Self::create_swapchain_image_views(&device, &swapchain_images, &swapchain_properties);
+
+        let _pipeline = Self::create_pipeline(&device);
 
         Self {
             instance,
@@ -498,6 +504,41 @@ impl VulkanApp {
                 unsafe { device.create_image_view(&image_view_info, None).unwrap() }
             })
             .collect::<Vec<_>>()
+    }
+
+    fn create_pipeline(device: &Device) {
+        let shader_code = Self::read_shader_from_file("shaders/shader.spv");
+        let shader_module = Self::create_shader_module(device, &shader_code);
+
+        let vertex_shader_stage_info = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::VERTEX)
+            .module(shader_module)
+            .name(c"vertMain");
+
+        let fragment_shader_stage_info = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::FRAGMENT)
+            .module(shader_module)
+            .name(c"fragMain");
+
+        let _shader_stages = &[vertex_shader_stage_info, fragment_shader_stage_info];
+    }
+
+    fn read_shader_from_file<P: AsRef<std::path::Path>>(path: P) -> Vec<u32> {
+        log::debug!("Loading shader file: {}", path.as_ref().to_str().unwrap());
+        let mut buffer = Vec::new();
+        let mut file = File::open(path).unwrap();
+        file.read_to_end(&mut buffer).unwrap();
+        let mut cursor = Cursor::new(buffer);
+        ash::util::read_spv(&mut cursor).unwrap()
+    }
+
+    fn create_shader_module(device: &Device, code: &[u32]) -> vk::ShaderModule {
+        let shader_module_info = vk::ShaderModuleCreateInfo::default().code(code);
+        unsafe {
+            device
+                .create_shader_module(&shader_module_info, None)
+                .unwrap()
+        }
     }
 }
 
