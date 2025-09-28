@@ -86,6 +86,7 @@ struct VulkanApp {
     swapchain_khr: vk::SwapchainKHR,
     swapchain_images: Vec<vk::Image>,
     swapchain_properties: SwapchainProperties,
+    swapchain_image_views: Vec<vk::ImageView>,
 }
 
 impl VulkanApp {
@@ -122,6 +123,9 @@ impl VulkanApp {
                 present_index,
             );
 
+        let swapchain_image_views =
+            Self::create_swapchain_image_views(&device, &swapchain_images, &swapchain_properties);
+
         Self {
             instance,
             debug_messenger,
@@ -136,6 +140,7 @@ impl VulkanApp {
             swapchain_khr,
             swapchain_images,
             swapchain_properties,
+            swapchain_image_views,
         }
     }
 
@@ -469,11 +474,39 @@ impl VulkanApp {
             swapchain_properties,
         )
     }
+
+    fn create_swapchain_image_views(
+        device: &Device,
+        swapchain_images: &[vk::Image],
+        swapchain_properties: &SwapchainProperties,
+    ) -> Vec<vk::ImageView> {
+        let mut image_view_info = vk::ImageViewCreateInfo::default()
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(swapchain_properties.format.format)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+
+        swapchain_images
+            .iter()
+            .map(|image| {
+                image_view_info = image_view_info.image(*image);
+                unsafe { device.create_image_view(&image_view_info, None).unwrap() }
+            })
+            .collect::<Vec<_>>()
+    }
 }
 
 impl Drop for VulkanApp {
     fn drop(&mut self) {
         unsafe {
+            self.swapchain_image_views
+                .iter()
+                .for_each(|iv| self.device.destroy_image_view(*iv, None));
             self.swapchain_device
                 .destroy_swapchain(self.swapchain_khr, None);
             self.device.destroy_device(None);
