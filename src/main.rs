@@ -520,7 +520,57 @@ impl VulkanApp {
             .module(shader_module)
             .name(c"fragMain");
 
-        let _shader_stages = &[vertex_shader_stage_info, fragment_shader_stage_info];
+        let shader_stages = &[vertex_shader_stage_info, fragment_shader_stage_info];
+
+        let dynamic_states = vec![vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+
+        // We'll get back to it in the vertex buffer chapter.
+        let vertex_input_info = vk::PipelineVertexInputStateCreateInfo::default();
+
+        let input_assembly_info = vk::PipelineInputAssemblyStateCreateInfo::default()
+            .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+
+        let viewport_info = vk::PipelineViewportStateCreateInfo::default()
+            .viewport_count(1)
+            .scissor_count(1);
+
+        let rasterization_info = vk::PipelineRasterizationStateCreateInfo::default()
+            .depth_clamp_enable(false)
+            .rasterizer_discard_enable(false)
+            .polygon_mode(vk::PolygonMode::FILL)
+            .cull_mode(vk::CullModeFlags::BACK)
+            .front_face(vk::FrontFace::CLOCKWISE)
+            .depth_bias_enable(false)
+            .depth_bias_slope_factor(1.0)
+            .line_width(1.0);
+
+        // We'll revisit multisampling in later chapter
+        let multisampling_info = vk::PipelineMultisampleStateCreateInfo::default()
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1)
+            .sample_shading_enable(false);
+
+        // TODO: Depth and stencil testing
+
+        // Alpha blending
+        let color_blend_attachment = vk::PipelineColorBlendAttachmentState::default()
+            .color_write_mask(vk::ColorComponentFlags::RGBA)
+            .blend_enable(true)
+            .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+            .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .color_blend_op(vk::BlendOp::ADD)
+            .src_alpha_blend_factor(vk::BlendFactor::ONE)
+            .dst_alpha_blend_factor(vk::BlendFactor::ZERO)
+            .alpha_blend_op(vk::BlendOp::ADD);
+        let color_blend_info = vk::PipelineColorBlendStateCreateInfo::default()
+            .logic_op_enable(false)
+            .attachments(&[color_blend_attachment]);
+
+        let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default();
+        let pipeline_layout = unsafe {
+            device
+                .create_pipeline_layout(&pipeline_layout_info, None)
+                .unwrap()
+        };
     }
 
     fn read_shader_from_file<P: AsRef<std::path::Path>>(path: P) -> Vec<u32> {
