@@ -91,6 +91,9 @@ struct VulkanApp {
     swapchain_images: Vec<vk::Image>,
     swapchain_properties: SwapchainProperties,
     swapchain_image_views: Vec<vk::ImageView>,
+
+    pipeline_layout: vk::PipelineLayout,
+    pipeline: vk::Pipeline,
 }
 
 impl VulkanApp {
@@ -130,7 +133,7 @@ impl VulkanApp {
         let swapchain_image_views =
             Self::create_swapchain_image_views(&device, &swapchain_images, &swapchain_properties);
 
-        let _pipeline = Self::create_pipeline(&device);
+        let (pipeline, pipeline_layout) = Self::create_pipeline(&device, &swapchain_properties);
 
         Self {
             instance,
@@ -147,6 +150,9 @@ impl VulkanApp {
             swapchain_images,
             swapchain_properties,
             swapchain_image_views,
+
+            pipeline_layout,
+            pipeline,
         }
     }
 
@@ -506,7 +512,10 @@ impl VulkanApp {
             .collect::<Vec<_>>()
     }
 
-    fn create_pipeline(device: &Device) {
+    fn create_pipeline(
+        device: &Device,
+        swapchain_properties: &SwapchainProperties,
+    ) -> (vk::Pipeline, vk::PipelineLayout) {
         let shader_code = Self::read_shader_from_file("shaders/shader.spv");
         let shader_module = Self::create_shader_module(device, &shader_code);
 
@@ -523,6 +532,8 @@ impl VulkanApp {
         let shader_stages = &[vertex_shader_stage_info, fragment_shader_stage_info];
 
         let dynamic_states = vec![vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        let dynamic_state_info =
+            vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
 
         // We'll get back to it in the vertex buffer chapter.
         let vertex_input_info = vk::PipelineVertexInputStateCreateInfo::default();
@@ -561,9 +572,10 @@ impl VulkanApp {
             .src_alpha_blend_factor(vk::BlendFactor::ONE)
             .dst_alpha_blend_factor(vk::BlendFactor::ZERO)
             .alpha_blend_op(vk::BlendOp::ADD);
+        let color_blend_attachment = &[color_blend_attachment];
         let color_blend_info = vk::PipelineColorBlendStateCreateInfo::default()
             .logic_op_enable(false)
-            .attachments(&[color_blend_attachment]);
+            .attachments(color_blend_attachment);
 
         let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default();
         let pipeline_layout = unsafe {
@@ -571,6 +583,37 @@ impl VulkanApp {
                 .create_pipeline_layout(&pipeline_layout_info, None)
                 .unwrap()
         };
+
+        // Dynamic rendering
+        let format = &[swapchain_properties.format.format];
+        let mut rendering_info =
+            vk::PipelineRenderingCreateInfo::default().color_attachment_formats(format);
+
+        let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
+            .push_next(&mut rendering_info)
+            .stages(shader_stages)
+            .vertex_input_state(&vertex_input_info)
+            .input_assembly_state(&input_assembly_info)
+            .viewport_state(&viewport_info)
+            .rasterization_state(&rasterization_info)
+            .multisample_state(&multisampling_info)
+            .color_blend_state(&color_blend_info)
+            .dynamic_state(&dynamic_state_info)
+            .layout(pipeline_layout)
+            // render_pass is set to null because we're using dynamic rendering instead of a traditional render pass.
+            .render_pass(vk::RenderPass::null());
+        let pipeline_infos = &[pipeline_info];
+        let pipeline = unsafe {
+            device
+                .create_graphics_pipelines(vk::PipelineCache::null(), pipeline_infos, None)
+                .unwrap()[0]
+        };
+
+        unsafe {
+            device.destroy_shader_module(shader_module, None);
+        };
+
+        (pipeline, pipeline_layout)
     }
 
     fn read_shader_from_file<P: AsRef<std::path::Path>>(path: P) -> Vec<u32> {
@@ -595,11 +638,16 @@ impl VulkanApp {
 impl Drop for VulkanApp {
     fn drop(&mut self) {
         unsafe {
+            self.device.destroy_pipeline(self.pipeline, None);
+            self.device
+                .destroy_pipeline_layout(self.pipeline_layout, None);
+
             self.swapchain_image_views
                 .iter()
                 .for_each(|iv| self.device.destroy_image_view(*iv, None));
             self.swapchain_device
                 .destroy_swapchain(self.swapchain_khr, None);
+
             self.device.destroy_device(None);
             self.surface_instance
                 .destroy_surface(self.surface_khr, None);
