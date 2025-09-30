@@ -5,6 +5,7 @@ use std::{
     ffi::CStr,
     fs::File,
     io::{Cursor, Read},
+    u64,
 };
 
 use ash::{
@@ -69,9 +70,15 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn about_to_wait(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+    fn about_to_wait(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop) {
         let app = self.vulkan.as_mut().unwrap();
-        let window = self.window.as_ref().unwrap();
+        app.draw_frame();
+    }
+
+    fn exiting(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop) {
+        if let Some(vulkan) = self.vulkan.as_ref() {
+            unsafe { vulkan.device.device_wait_idle().unwrap() }
+        }
     }
 }
 
@@ -97,6 +104,10 @@ struct VulkanApp {
 
     command_pool: vk::CommandPool,
     command_buffer: vk::CommandBuffer,
+
+    present_complete_semaphore: vk::Semaphore,
+    render_finished_semaphore: vk::Semaphore,
+    draw_fence: vk::Fence,
 }
 
 impl VulkanApp {
@@ -141,6 +152,9 @@ impl VulkanApp {
         let command_pool = Self::create_command_pool(&device, graphics_index);
         let command_buffer = Self::create_command_buffer(&device, command_pool);
 
+        let (present_complete_semaphore, render_finished_semaphore, draw_fence) =
+            Self::create_sync_objects(&device);
+
         Self {
             instance,
             debug_messenger,
@@ -162,6 +176,10 @@ impl VulkanApp {
 
             command_pool,
             command_buffer,
+
+            present_complete_semaphore,
+            render_finished_semaphore,
+            draw_fence,
         }
     }
 
@@ -795,11 +813,96 @@ impl VulkanApp {
 
         unsafe { device.cmd_pipeline_barrier2(command_buffer, &dependency_info) };
     }
+
+    fn create_sync_objects(device: &Device) -> (vk::Semaphore, vk::Semaphore, vk::Fence) {
+        let semaphore_info = vk::SemaphoreCreateInfo::default();
+        let present_complete_semaphore =
+            unsafe { device.create_semaphore(&semaphore_info, None).unwrap() };
+        let render_finished_semaphore =
+            unsafe { device.create_semaphore(&semaphore_info, None).unwrap() };
+
+        let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
+        let fence = unsafe { device.create_fence(&fence_info, None).unwrap() };
+
+        (present_complete_semaphore, render_finished_semaphore, fence)
+    }
+
+    fn draw_frame(&mut self) {
+        let (image_index, _) = unsafe {
+            self.swapchain_device
+                .acquire_next_image(
+                    self.swapchain_khr,
+                    u64::MAX,
+                    self.present_complete_semaphore,
+                    vk::Fence::null(),
+                )
+                .unwrap()
+        };
+
+        Self::record_command_buffer(
+            &self.device,
+            self.command_buffer,
+            &self.swapchain_images,
+            &self.swapchain_image_views,
+            &self.swapchain_properties,
+            image_index as _,
+            self.pipeline,
+        );
+
+        unsafe { self.device.reset_fences(&[self.draw_fence]).unwrap() }
+
+        // Submit
+        {
+            let wait_semaphores = &[self.present_complete_semaphore];
+            let command_buffers = &[self.command_buffer];
+            let signal_semaphores = &[self.render_finished_semaphore];
+            let submit_info = vk::SubmitInfo::default()
+                .wait_semaphores(wait_semaphores)
+                .wait_dst_stage_mask(&[vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT])
+                .command_buffers(command_buffers)
+                .signal_semaphores(signal_semaphores);
+
+            unsafe {
+                self.device
+                    .queue_submit(self.graphics_queue, &[submit_info], self.draw_fence)
+                    .unwrap()
+            }
+        }
+
+        unsafe {
+            self.device
+                .wait_for_fences(&[self.draw_fence], true, u64::MAX)
+                .unwrap()
+        }
+
+        // Present
+        {
+            let wait_semaphores = &[self.render_finished_semaphore];
+            let swapchains = &[self.swapchain_khr];
+            let image_indices = &[image_index];
+            let present_info = vk::PresentInfoKHR::default()
+                .wait_semaphores(wait_semaphores)
+                .swapchains(swapchains)
+                .image_indices(image_indices);
+
+            unsafe {
+                self.swapchain_device
+                    .queue_present(self.present_queue, &present_info)
+                    .unwrap()
+            };
+        }
+    }
 }
 
 impl Drop for VulkanApp {
     fn drop(&mut self) {
         unsafe {
+            self.device.destroy_fence(self.draw_fence, None);
+            self.device
+                .destroy_semaphore(self.render_finished_semaphore, None);
+            self.device
+                .destroy_semaphore(self.present_complete_semaphore, None);
+
             self.device
                 .free_command_buffers(self.command_pool, &[self.command_buffer]);
             self.device.destroy_command_pool(self.command_pool, None);
