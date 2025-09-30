@@ -385,8 +385,9 @@ impl VulkanApp {
                 .collect::<Vec<_>>()
         };
 
-        let mut vulkan_13_features =
-            vk::PhysicalDeviceVulkan13Features::default().dynamic_rendering(true);
+        let mut vulkan_13_features = vk::PhysicalDeviceVulkan13Features::default()
+            .dynamic_rendering(true)
+            .synchronization2(true);
         let mut extended_dynamic_state_features =
             vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT::default()
                 .extended_dynamic_state(true);
