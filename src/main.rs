@@ -372,9 +372,12 @@ impl VulkanApp {
         let mut extended_dynamic_state_features =
             vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT::default()
                 .extended_dynamic_state(true);
+        let mut shader_draw_parameters_features =
+            vk::PhysicalDeviceShaderDrawParametersFeatures::default().shader_draw_parameters(true);
         let mut device_features = vk::PhysicalDeviceFeatures2::default()
             .push_next(&mut vulkan_13_features)
-            .push_next(&mut extended_dynamic_state_features);
+            .push_next(&mut extended_dynamic_state_features)
+            .push_next(&mut shader_draw_parameters_features);
 
         let device_extensions_ptrs = Self::get_required_device_extensions()
             .iter()
