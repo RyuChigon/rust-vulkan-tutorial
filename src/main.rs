@@ -829,6 +829,8 @@ impl VulkanApp {
     }
 
     fn draw_frame(&mut self) {
+        unsafe { self.device.queue_wait_idle(self.present_queue).unwrap() }
+
         let (image_index, _) = unsafe {
             self.swapchain_device
                 .acquire_next_image(
