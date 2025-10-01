@@ -33,6 +33,8 @@ use crate::{
 const WIDTH: u32 = 1080;
 const HEIGHT: u32 = 720;
 
+const MAX_FRAMES_IN_FLIGHT: u32 = 2;
+
 #[derive(Default)]
 struct App {
     vulkan: Option<VulkanApp>,
@@ -103,11 +105,10 @@ struct VulkanApp {
     pipeline: vk::Pipeline,
 
     command_pool: vk::CommandPool,
-    command_buffer: vk::CommandBuffer,
+    command_buffers: Vec<vk::CommandBuffer>,
 
-    present_complete_semaphore: vk::Semaphore,
-    render_finished_semaphore: vk::Semaphore,
-    draw_fence: vk::Fence,
+    sync_objects: Vec<SyncObjects>,
+    current_frame: usize,
 }
 
 impl VulkanApp {
@@ -150,10 +151,9 @@ impl VulkanApp {
         let (pipeline, pipeline_layout) = Self::create_pipeline(&device, &swapchain_properties);
 
         let command_pool = Self::create_command_pool(&device, graphics_index);
-        let command_buffer = Self::create_command_buffer(&device, command_pool);
+        let command_buffers = Self::create_command_buffers(&device, command_pool);
 
-        let (present_complete_semaphore, render_finished_semaphore, draw_fence) =
-            Self::create_sync_objects(&device);
+        let sync_objects = Self::create_sync_objects(&device);
 
         Self {
             instance,
@@ -175,11 +175,10 @@ impl VulkanApp {
             pipeline,
 
             command_pool,
-            command_buffer,
+            command_buffers,
 
-            present_complete_semaphore,
-            render_finished_semaphore,
-            draw_fence,
+            sync_objects,
+            current_frame: 0,
         }
     }
 
@@ -677,16 +676,19 @@ impl VulkanApp {
         }
     }
 
-    fn create_command_buffer(device: &Device, command_pool: vk::CommandPool) -> vk::CommandBuffer {
+    fn create_command_buffers(
+        device: &Device,
+        command_pool: vk::CommandPool,
+    ) -> Vec<vk::CommandBuffer> {
         let command_buffer_allocate_info = vk::CommandBufferAllocateInfo::default()
             .command_pool(command_pool)
             .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
+            .command_buffer_count(MAX_FRAMES_IN_FLIGHT);
 
         unsafe {
             device
                 .allocate_command_buffers(&command_buffer_allocate_info)
-                .unwrap()[0]
+                .unwrap()
         }
     }
 
@@ -815,36 +817,59 @@ impl VulkanApp {
         unsafe { device.cmd_pipeline_barrier2(command_buffer, &dependency_info) };
     }
 
-    fn create_sync_objects(device: &Device) -> (vk::Semaphore, vk::Semaphore, vk::Fence) {
+    fn create_sync_objects(device: &Device) -> Vec<SyncObjects> {
         let semaphore_info = vk::SemaphoreCreateInfo::default();
-        let present_complete_semaphore =
-            unsafe { device.create_semaphore(&semaphore_info, None).unwrap() };
-        let render_finished_semaphore =
-            unsafe { device.create_semaphore(&semaphore_info, None).unwrap() };
-
         let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
-        let fence = unsafe { device.create_fence(&fence_info, None).unwrap() };
 
-        (present_complete_semaphore, render_finished_semaphore, fence)
+        let mut sync_objects_vec = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT as _);
+        for _ in 0..MAX_FRAMES_IN_FLIGHT {
+            let present_complete_semaphore =
+                unsafe { device.create_semaphore(&semaphore_info, None).unwrap() };
+            let render_finished_semaphore =
+                unsafe { device.create_semaphore(&semaphore_info, None).unwrap() };
+
+            let in_flight_fence = unsafe { device.create_fence(&fence_info, None).unwrap() };
+
+            let sync_objects = SyncObjects {
+                present_complete_semaphore,
+                render_finished_semaphore,
+                in_flight_fence,
+            };
+            sync_objects_vec.push(sync_objects);
+        }
+
+        sync_objects_vec
     }
 
     fn draw_frame(&mut self) {
-        unsafe { self.device.queue_wait_idle(self.present_queue).unwrap() }
+        let SyncObjects {
+            present_complete_semaphore,
+            render_finished_semaphore,
+            in_flight_fence,
+        } = self.sync_objects[self.current_frame];
+        let command_buffer = self.command_buffers[self.current_frame];
+        unsafe {
+            self.device
+                .wait_for_fences(&[in_flight_fence], true, u64::MAX)
+                .unwrap()
+        }
 
         let (image_index, _) = unsafe {
             self.swapchain_device
                 .acquire_next_image(
                     self.swapchain_khr,
                     u64::MAX,
-                    self.present_complete_semaphore,
+                    present_complete_semaphore,
                     vk::Fence::null(),
                 )
                 .unwrap()
         };
 
+        unsafe { self.device.reset_fences(&[in_flight_fence]).unwrap() }
+
         Self::record_command_buffer(
             &self.device,
-            self.command_buffer,
+            command_buffer,
             &self.swapchain_images,
             &self.swapchain_image_views,
             &self.swapchain_properties,
@@ -852,13 +877,11 @@ impl VulkanApp {
             self.pipeline,
         );
 
-        unsafe { self.device.reset_fences(&[self.draw_fence]).unwrap() }
-
         // Submit
         {
-            let wait_semaphores = &[self.present_complete_semaphore];
-            let command_buffers = &[self.command_buffer];
-            let signal_semaphores = &[self.render_finished_semaphore];
+            let wait_semaphores = &[present_complete_semaphore];
+            let command_buffers = &[command_buffer];
+            let signal_semaphores = &[render_finished_semaphore];
             let submit_info = vk::SubmitInfo::default()
                 .wait_semaphores(wait_semaphores)
                 .wait_dst_stage_mask(&[vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT])
@@ -867,20 +890,20 @@ impl VulkanApp {
 
             unsafe {
                 self.device
-                    .queue_submit(self.graphics_queue, &[submit_info], self.draw_fence)
+                    .queue_submit(self.graphics_queue, &[submit_info], in_flight_fence)
                     .unwrap()
             }
         }
 
         unsafe {
             self.device
-                .wait_for_fences(&[self.draw_fence], true, u64::MAX)
+                .wait_for_fences(&[in_flight_fence], true, u64::MAX)
                 .unwrap()
         }
 
         // Present
         {
-            let wait_semaphores = &[self.render_finished_semaphore];
+            let wait_semaphores = &[render_finished_semaphore];
             let swapchains = &[self.swapchain_khr];
             let image_indices = &[image_index];
             let present_info = vk::PresentInfoKHR::default()
@@ -894,20 +917,20 @@ impl VulkanApp {
                     .unwrap()
             };
         }
+
+        self.current_frame = (self.current_frame + 1) % (MAX_FRAMES_IN_FLIGHT as usize);
     }
 }
 
 impl Drop for VulkanApp {
     fn drop(&mut self) {
         unsafe {
-            self.device.destroy_fence(self.draw_fence, None);
-            self.device
-                .destroy_semaphore(self.render_finished_semaphore, None);
-            self.device
-                .destroy_semaphore(self.present_complete_semaphore, None);
+            self.sync_objects
+                .iter()
+                .for_each(|o| o.destroy(&self.device));
 
             self.device
-                .free_command_buffers(self.command_pool, &[self.command_buffer]);
+                .free_command_buffers(self.command_pool, &self.command_buffers);
             self.device.destroy_command_pool(self.command_pool, None);
             self.device.destroy_pipeline(self.pipeline, None);
             self.device
@@ -938,4 +961,21 @@ fn main() {
 
     let mut app = App::default();
     event_loop.run_app(&mut app).unwrap();
+}
+
+#[derive(Clone, Copy)]
+struct SyncObjects {
+    present_complete_semaphore: vk::Semaphore,
+    render_finished_semaphore: vk::Semaphore,
+    in_flight_fence: vk::Fence,
+}
+
+impl SyncObjects {
+    fn destroy(&self, device: &Device) {
+        unsafe {
+            device.destroy_fence(self.in_flight_fence, None);
+            device.destroy_semaphore(self.render_finished_semaphore, None);
+            device.destroy_semaphore(self.present_complete_semaphore, None);
+        }
+    }
 }
