@@ -33,8 +33,6 @@ use crate::{
 const WIDTH: u32 = 1080;
 const HEIGHT: u32 = 720;
 
-const MAX_FRAMES_IN_FLIGHT: u32 = 2;
-
 #[derive(Default)]
 struct App {
     vulkan: Option<VulkanApp>,
@@ -144,6 +142,7 @@ impl VulkanApp {
                 graphics_index,
                 present_index,
             );
+        let swapchain_images_len = swapchain_images.len();
 
         let swapchain_image_views =
             Self::create_swapchain_image_views(&device, &swapchain_images, &swapchain_properties);
@@ -151,9 +150,10 @@ impl VulkanApp {
         let (pipeline, pipeline_layout) = Self::create_pipeline(&device, &swapchain_properties);
 
         let command_pool = Self::create_command_pool(&device, graphics_index);
-        let command_buffers = Self::create_command_buffers(&device, command_pool);
+        let command_buffers =
+            Self::create_command_buffers(&device, command_pool, swapchain_images_len);
 
-        let sync_objects = Self::create_sync_objects(&device);
+        let sync_objects = Self::create_sync_objects(&device, swapchain_images_len);
 
         Self {
             instance,
@@ -679,11 +679,12 @@ impl VulkanApp {
     fn create_command_buffers(
         device: &Device,
         command_pool: vk::CommandPool,
+        swapchain_image_len: usize,
     ) -> Vec<vk::CommandBuffer> {
         let command_buffer_allocate_info = vk::CommandBufferAllocateInfo::default()
             .command_pool(command_pool)
             .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(MAX_FRAMES_IN_FLIGHT);
+            .command_buffer_count(swapchain_image_len as _);
 
         unsafe {
             device
@@ -817,12 +818,12 @@ impl VulkanApp {
         unsafe { device.cmd_pipeline_barrier2(command_buffer, &dependency_info) };
     }
 
-    fn create_sync_objects(device: &Device) -> Vec<SyncObjects> {
+    fn create_sync_objects(device: &Device, swapchain_image_len: usize) -> Vec<SyncObjects> {
         let semaphore_info = vk::SemaphoreCreateInfo::default();
         let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
 
-        let mut sync_objects_vec = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT as _);
-        for _ in 0..MAX_FRAMES_IN_FLIGHT {
+        let mut sync_objects_vec = Vec::with_capacity(swapchain_image_len as _);
+        for _ in 0..swapchain_image_len {
             let present_complete_semaphore =
                 unsafe { device.create_semaphore(&semaphore_info, None).unwrap() };
             let render_finished_semaphore =
@@ -918,7 +919,7 @@ impl VulkanApp {
             };
         }
 
-        self.current_frame = (self.current_frame + 1) % (MAX_FRAMES_IN_FLIGHT as usize);
+        self.current_frame = (self.current_frame + 1) % self.swapchain_images.len();
     }
 }
 
