@@ -63,8 +63,16 @@ impl ApplicationHandler for App {
             WindowEvent::CloseRequested => {
                 event_loop.exit();
             }
-            WindowEvent::Resized(_new_dimensions) => {
-                // TODO
+            WindowEvent::Resized(new_dimensions) => {
+                if let Some(vulkan_app) = self.vulkan.as_mut() {
+                    let is_dimensions_changed = new_dimensions.width
+                        != vulkan_app.swapchain_properties.extent.width
+                        || new_dimensions.height != vulkan_app.swapchain_properties.extent.height;
+
+                    if is_dimensions_changed {
+                        vulkan_app.dirty_swapchain = true;
+                    }
+                }
             }
             _ => {}
         }
@@ -72,7 +80,19 @@ impl ApplicationHandler for App {
 
     fn about_to_wait(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop) {
         let app = self.vulkan.as_mut().unwrap();
-        app.draw_frame();
+        let window = self.window.as_ref().unwrap();
+
+        if app.dirty_swapchain {
+            let size = window.inner_size();
+            if size.width > 0 && size.height > 0 {
+                app.recreate_swapchain();
+            } else {
+                // Handling minimization
+                return;
+            }
+        }
+
+        app.dirty_swapchain = app.draw_frame();
     }
 
     fn exiting(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop) {
@@ -83,10 +103,13 @@ impl ApplicationHandler for App {
 }
 
 struct VulkanApp {
+    _entry: ash::Entry,
     instance: Instance,
     debug_messenger: Option<(debug_utils::Instance, DebugUtilsMessengerEXT)>,
     physical_device: vk::PhysicalDevice,
     device: Device,
+    graphics_index: u32,
+    present_index: u32,
     graphics_queue: vk::Queue,
     present_queue: vk::Queue,
 
@@ -107,6 +130,8 @@ struct VulkanApp {
 
     sync_objects: Vec<SyncObjects>,
     current_frame: usize,
+
+    dirty_swapchain: bool,
 }
 
 impl VulkanApp {
@@ -156,10 +181,13 @@ impl VulkanApp {
         let sync_objects = Self::create_sync_objects(&device, swapchain_images_len);
 
         Self {
+            _entry: entry, // When entry is dropped, getting a surface when recreate swapchain throws error
             instance,
             debug_messenger,
             physical_device,
             device,
+            graphics_index,
+            present_index,
             graphics_queue,
             present_queue,
             surface_instance,
@@ -179,6 +207,8 @@ impl VulkanApp {
 
             sync_objects,
             current_frame: 0,
+
+            dirty_swapchain: false,
         }
     }
 
@@ -205,8 +235,8 @@ impl VulkanApp {
             extension_names.push(ash::khr::get_physical_device_properties2::NAME.as_ptr());
         }
 
-        // _layer_names를 _로 하면 ERROR_LAYER_NOT_PRESENT가 발생.
-        // _로 하면 layer_names를 Drop 시키거나 버리기 때문
+        // If _layer_names is named with underscore, ERROR_LAYER_NOT_PRESENT occurs.
+        // This happens because with an underscore, layer_names gets dropped or discarded.
         let (_layer_names, layer_names_ptrs) = get_layer_names_and_pointers();
 
         let create_flags = if cfg!(any(target_os = "macos", target_os = "ios")) {
@@ -842,7 +872,7 @@ impl VulkanApp {
         sync_objects_vec
     }
 
-    fn draw_frame(&mut self) {
+    fn draw_frame(&mut self) -> bool /* dirty_swapchain */ {
         let SyncObjects {
             present_complete_semaphore,
             render_finished_semaphore,
@@ -855,15 +885,21 @@ impl VulkanApp {
                 .unwrap()
         }
 
-        let (image_index, _) = unsafe {
-            self.swapchain_device
-                .acquire_next_image(
-                    self.swapchain_khr,
-                    u64::MAX,
-                    present_complete_semaphore,
-                    vk::Fence::null(),
-                )
-                .unwrap()
+        let result = unsafe {
+            self.swapchain_device.acquire_next_image(
+                self.swapchain_khr,
+                u64::MAX,
+                present_complete_semaphore,
+                vk::Fence::null(),
+            )
+        };
+        let image_index = match result {
+            Ok((image_index, _)) => image_index,
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                log::debug!("Swapchain is dirty from acquiring next image.");
+                return true;
+            }
+            Err(error) => panic!("Error while acquiring next image. Cause: {}", error),
         };
 
         unsafe { self.device.reset_fences(&[in_flight_fence]).unwrap() }
@@ -912,14 +948,63 @@ impl VulkanApp {
                 .swapchains(swapchains)
                 .image_indices(image_indices);
 
-            unsafe {
+            let result = unsafe {
                 self.swapchain_device
                     .queue_present(self.present_queue, &present_info)
-                    .unwrap()
             };
+            match result {
+                Ok(true) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                    log::debug!("Swapchain is dirty from presenting.");
+                    return true;
+                }
+                Err(error) => panic!("Failed to present queue. Cause: {}", error),
+                _ => {}
+            }
         }
 
         self.current_frame = (self.current_frame + 1) % self.swapchain_images.len();
+
+        false
+    }
+
+    fn recreate_swapchain(&mut self) {
+        log::debug!("recreate swapchain");
+        unsafe { self.device.device_wait_idle().unwrap() }
+
+        self.cleanup_swapchain();
+
+        let (swapchain_device, swapchain_khr, swapchain_images, swapchain_properties) =
+            Self::create_swapchain(
+                &self.instance,
+                &self.device,
+                self.physical_device,
+                &self.surface_instance,
+                self.surface_khr,
+                self.graphics_index,
+                self.present_index,
+            );
+
+        let swapchain_image_views = Self::create_swapchain_image_views(
+            &self.device,
+            &swapchain_images,
+            &swapchain_properties,
+        );
+
+        self.swapchain_device = swapchain_device;
+        self.swapchain_khr = swapchain_khr;
+        self.swapchain_images = swapchain_images;
+        self.swapchain_properties = swapchain_properties;
+        self.swapchain_image_views = swapchain_image_views;
+    }
+
+    fn cleanup_swapchain(&mut self) {
+        unsafe {
+            self.swapchain_image_views
+                .iter()
+                .for_each(|iv| self.device.destroy_image_view(*iv, None));
+            self.swapchain_device
+                .destroy_swapchain(self.swapchain_khr, None);
+        }
     }
 }
 
@@ -937,11 +1022,7 @@ impl Drop for VulkanApp {
             self.device
                 .destroy_pipeline_layout(self.pipeline_layout, None);
 
-            self.swapchain_image_views
-                .iter()
-                .for_each(|iv| self.device.destroy_image_view(*iv, None));
-            self.swapchain_device
-                .destroy_swapchain(self.swapchain_khr, None);
+            self.cleanup_swapchain();
 
             self.device.destroy_device(None);
             self.surface_instance
