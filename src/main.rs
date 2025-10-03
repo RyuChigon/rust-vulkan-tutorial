@@ -5,6 +5,7 @@ use std::{
     ffi::CStr,
     fs::File,
     io::{Cursor, Read},
+    mem::offset_of,
     u64,
 };
 
@@ -595,8 +596,11 @@ impl VulkanApp {
         let dynamic_state_info =
             vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
 
-        // We'll get back to it in the vertex buffer chapter.
-        let vertex_input_info = vk::PipelineVertexInputStateCreateInfo::default();
+        let vertex_binding_descriptions = &[Vertex::get_binding_description()];
+        let vertex_attribute_descriptions = &Vertex::get_attribute_descriptions();
+        let vertex_input_info = vk::PipelineVertexInputStateCreateInfo::default()
+            .vertex_binding_descriptions(vertex_binding_descriptions)
+            .vertex_attribute_descriptions(vertex_attribute_descriptions);
 
         let input_assembly_info = vk::PipelineInputAssemblyStateCreateInfo::default()
             .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
@@ -1059,5 +1063,49 @@ impl SyncObjects {
             device.destroy_semaphore(self.render_finished_semaphore, None);
             device.destroy_semaphore(self.present_complete_semaphore, None);
         }
+    }
+}
+
+struct Vertex {
+    pos: [f32; 2],
+    color: [f32; 3],
+}
+
+const VERTICES: [Vertex; 3] = [
+    Vertex {
+        pos: [0.0, -0.5],
+        color: [1.0, 0.0, 0.0],
+    },
+    Vertex {
+        pos: [0.5, 0.5],
+        color: [0.0, 1.0, 0.0],
+    },
+    Vertex {
+        pos: [-0.5, 0.5],
+        color: [0.0, 0.0, 1.0],
+    },
+];
+
+impl Vertex {
+    fn get_binding_description() -> vk::VertexInputBindingDescription {
+        vk::VertexInputBindingDescription::default()
+            .binding(0)
+            .stride(size_of::<Vertex>() as _)
+            .input_rate(vk::VertexInputRate::VERTEX)
+    }
+
+    fn get_attribute_descriptions() -> [vk::VertexInputAttributeDescription; 2] {
+        [
+            vk::VertexInputAttributeDescription::default()
+                .location(0)
+                .binding(0)
+                .format(vk::Format::R32G32_SFLOAT)
+                .offset(offset_of!(Vertex, pos) as _),
+            vk::VertexInputAttributeDescription::default()
+                .location(1)
+                .binding(0)
+                .format(vk::Format::R32G32B32_SFLOAT)
+                .offset(offset_of!(Vertex, color) as _),
+        ]
     }
 }
