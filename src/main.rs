@@ -31,8 +31,8 @@ use crate::{
     swapchain_properties::{SwapchainProperties, SwapchainSupportDetails},
 };
 
-const WIDTH: u32 = 1080;
-const HEIGHT: u32 = 720;
+const WIDTH: u32 = 1024;
+const HEIGHT: u32 = 768;
 
 #[derive(Default)]
 struct App {
@@ -129,6 +129,9 @@ struct VulkanApp {
     command_pool: vk::CommandPool,
     command_buffers: Vec<vk::CommandBuffer>,
 
+    vertex_buffer: vk::Buffer,
+    vertex_buffer_memory: vk::DeviceMemory,
+
     sync_objects: Vec<SyncObjects>,
     current_frame: usize,
 
@@ -179,6 +182,9 @@ impl VulkanApp {
         let command_buffers =
             Self::create_command_buffers(&device, command_pool, swapchain_images_len);
 
+        let (vertex_buffer, vertex_buffer_memory) =
+            Self::create_vertex_buffer(&instance, &device, physical_device);
+
         let sync_objects = Self::create_sync_objects(&device, swapchain_images_len);
 
         Self {
@@ -205,6 +211,9 @@ impl VulkanApp {
 
             command_pool,
             command_buffers,
+
+            vertex_buffer,
+            vertex_buffer_memory,
 
             sync_objects,
             current_frame: 0,
@@ -727,6 +736,70 @@ impl VulkanApp {
         }
     }
 
+    fn create_vertex_buffer(
+        instance: &Instance,
+        device: &Device,
+        physical_device: vk::PhysicalDevice,
+    ) -> (vk::Buffer, vk::DeviceMemory) {
+        let buffer_info = vk::BufferCreateInfo::default()
+            .size((size_of::<Vertex>() * VERTICES.len()) as vk::DeviceSize)
+            .usage(vk::BufferUsageFlags::VERTEX_BUFFER)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+        let vertex_buffer = unsafe { device.create_buffer(&buffer_info, None).unwrap() };
+
+        let memory_requirements = unsafe { device.get_buffer_memory_requirements(vertex_buffer) };
+
+        let physical_device_memory_properties =
+            unsafe { instance.get_physical_device_memory_properties(physical_device) };
+
+        let memory_type_index = Self::find_memory_type_index(
+            memory_requirements,
+            physical_device_memory_properties,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        );
+
+        let memory_allocate_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(memory_requirements.size)
+            .memory_type_index(memory_type_index);
+
+        let memory = unsafe { device.allocate_memory(&memory_allocate_info, None).unwrap() };
+
+        unsafe { device.bind_buffer_memory(vertex_buffer, memory, 0).unwrap() };
+
+        unsafe {
+            let data_ptr = device
+                .map_memory(memory, 0, buffer_info.size, vk::MemoryMapFlags::empty())
+                .unwrap();
+            let mut align =
+                ash::util::Align::new(data_ptr, align_of::<u32>() as _, buffer_info.size);
+            align.copy_from_slice(&VERTICES);
+            device.unmap_memory(memory);
+        }
+
+        (vertex_buffer, memory)
+    }
+
+    fn find_memory_type_index(
+        memory_requirements: vk::MemoryRequirements,
+        physical_device_memory_properties: vk::PhysicalDeviceMemoryProperties,
+        memory_property_flags: vk::MemoryPropertyFlags,
+    ) -> u32 {
+        for i in 0..physical_device_memory_properties.memory_type_count {
+            if memory_requirements.memory_type_bits & (1 << i) == 0 {
+                continue;
+            }
+
+            let memory_type = physical_device_memory_properties.memory_types[i as usize];
+
+            if memory_type.property_flags.contains(memory_property_flags) {
+                return i;
+            }
+        }
+
+        panic!("Failed to find suitable memory type!");
+    }
+
     fn record_command_buffer(
         device: &Device,
         command_buffer: vk::CommandBuffer,
@@ -735,6 +808,7 @@ impl VulkanApp {
         swapchain_properties: &SwapchainProperties,
         image_index: usize,
         pipeline: vk::Pipeline,
+        vertex_buffer: vk::Buffer,
     ) {
         unsafe {
             device
@@ -796,6 +870,12 @@ impl VulkanApp {
         };
         unsafe { device.cmd_set_viewport(command_buffer, 0, &[viewport]) };
         unsafe { device.cmd_set_scissor(command_buffer, 0, &[scissor]) };
+
+        let vertex_buffers = &[vertex_buffer];
+        let vertex_buffer_offsets = &[0];
+        unsafe {
+            device.cmd_bind_vertex_buffers(command_buffer, 0, vertex_buffers, vertex_buffer_offsets)
+        };
 
         unsafe { device.cmd_draw(command_buffer, 3, 1, 0, 0) };
 
@@ -916,6 +996,7 @@ impl VulkanApp {
             &self.swapchain_properties,
             image_index as _,
             self.pipeline,
+            self.vertex_buffer,
         );
 
         // Submit
@@ -1019,6 +1100,9 @@ impl Drop for VulkanApp {
                 .iter()
                 .for_each(|o| o.destroy(&self.device));
 
+            self.device.free_memory(self.vertex_buffer_memory, None);
+            self.device.destroy_buffer(self.vertex_buffer, None);
+
             self.device
                 .free_command_buffers(self.command_pool, &self.command_buffers);
             self.device.destroy_command_pool(self.command_pool, None);
@@ -1066,6 +1150,7 @@ impl SyncObjects {
     }
 }
 
+#[derive(Clone, Copy)]
 struct Vertex {
     pos: [f32; 2],
     color: [f32; 3],
