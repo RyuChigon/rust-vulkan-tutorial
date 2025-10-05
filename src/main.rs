@@ -182,8 +182,13 @@ impl VulkanApp {
         let command_buffers =
             Self::create_command_buffers(&device, command_pool, swapchain_images_len);
 
-        let (vertex_buffer, vertex_buffer_memory) =
-            Self::create_vertex_buffer(&instance, &device, physical_device);
+        let (vertex_buffer, vertex_buffer_memory) = Self::create_vertex_buffer(
+            &instance,
+            &device,
+            physical_device,
+            command_pool,
+            graphics_queue,
+        );
 
         let sync_objects = Self::create_sync_objects(&device, swapchain_images_len);
 
@@ -740,10 +745,70 @@ impl VulkanApp {
         instance: &Instance,
         device: &Device,
         physical_device: vk::PhysicalDevice,
+        command_pool: vk::CommandPool,
+        graphics_queue: vk::Queue,
+    ) -> (vk::Buffer, vk::DeviceMemory) {
+        let buffer_size = (size_of::<Vertex>() * VERTICES.len()) as vk::DeviceSize;
+        let (staging_buffer, staging_buffer_memory) = Self::create_buffer(
+            instance,
+            device,
+            physical_device,
+            buffer_size,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        );
+
+        unsafe {
+            let data_ptr = device
+                .map_memory(
+                    staging_buffer_memory,
+                    0,
+                    buffer_size,
+                    vk::MemoryMapFlags::empty(),
+                )
+                .unwrap();
+            let mut align = ash::util::Align::new(data_ptr, align_of::<u32>() as _, buffer_size);
+            align.copy_from_slice(&VERTICES);
+            device.unmap_memory(staging_buffer_memory);
+        }
+
+        let (vertex_buffer, vertex_buffer_memory) = Self::create_buffer(
+            instance,
+            device,
+            physical_device,
+            buffer_size,
+            vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        );
+
+        Self::copy_buffer(
+            device,
+            command_pool,
+            graphics_queue,
+            staging_buffer,
+            vertex_buffer,
+            buffer_size,
+        );
+
+        unsafe {
+            device.destroy_buffer(staging_buffer, None);
+            device.free_memory(staging_buffer_memory, None);
+        }
+
+        (vertex_buffer, vertex_buffer_memory)
+    }
+
+    fn create_buffer(
+        instance: &Instance,
+        device: &Device,
+        physical_device: vk::PhysicalDevice,
+        size: vk::DeviceSize,
+        usage: vk::BufferUsageFlags,
+        memory_property_flags: vk::MemoryPropertyFlags,
     ) -> (vk::Buffer, vk::DeviceMemory) {
         let buffer_info = vk::BufferCreateInfo::default()
-            .size((size_of::<Vertex>() * VERTICES.len()) as vk::DeviceSize)
-            .usage(vk::BufferUsageFlags::VERTEX_BUFFER)
+            .size(size)
+            .usage(usage)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
 
         let vertex_buffer = unsafe { device.create_buffer(&buffer_info, None).unwrap() };
@@ -756,7 +821,7 @@ impl VulkanApp {
         let memory_type_index = Self::find_memory_type_index(
             memory_requirements,
             physical_device_memory_properties,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            memory_property_flags,
         );
 
         let memory_allocate_info = vk::MemoryAllocateInfo::default()
@@ -767,17 +832,53 @@ impl VulkanApp {
 
         unsafe { device.bind_buffer_memory(vertex_buffer, memory, 0).unwrap() };
 
+        (vertex_buffer, memory)
+    }
+
+    fn copy_buffer(
+        device: &Device,
+        command_pool: vk::CommandPool,
+        graphics_queue: vk::Queue,
+        src_buffer: vk::Buffer,
+        dst_buffer: vk::Buffer,
+        size: vk::DeviceSize,
+    ) {
+        let command_buffer_allocate_info = vk::CommandBufferAllocateInfo::default()
+            .command_pool(command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+
+        let command_buffer = unsafe {
+            device
+                .allocate_command_buffers(&command_buffer_allocate_info)
+                .unwrap()[0]
+        };
+
+        let command_buffer_begin_info = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+
         unsafe {
-            let data_ptr = device
-                .map_memory(memory, 0, buffer_info.size, vk::MemoryMapFlags::empty())
-                .unwrap();
-            let mut align =
-                ash::util::Align::new(data_ptr, align_of::<u32>() as _, buffer_info.size);
-            align.copy_from_slice(&VERTICES);
-            device.unmap_memory(memory);
+            device
+                .begin_command_buffer(command_buffer, &command_buffer_begin_info)
+                .unwrap()
         }
 
-        (vertex_buffer, memory)
+        let regions = &[vk::BufferCopy::default().size(size)];
+        unsafe { device.cmd_copy_buffer(command_buffer, src_buffer, dst_buffer, regions) };
+
+        unsafe { device.end_command_buffer(command_buffer).unwrap() }
+
+        let command_buffers = &[command_buffer];
+        let submit_info = &[vk::SubmitInfo::default().command_buffers(command_buffers)];
+        unsafe {
+            device
+                .queue_submit(graphics_queue, submit_info, vk::Fence::null())
+                .unwrap();
+
+            device.queue_wait_idle(graphics_queue).unwrap();
+        }
+
+        unsafe { device.free_command_buffers(command_pool, command_buffers) };
     }
 
     fn find_memory_type_index(
