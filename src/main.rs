@@ -132,6 +132,9 @@ struct VulkanApp {
     vertex_buffer: vk::Buffer,
     vertex_buffer_memory: vk::DeviceMemory,
 
+    index_buffer: vk::Buffer,
+    index_buffer_memory: vk::DeviceMemory,
+
     sync_objects: Vec<SyncObjects>,
     current_frame: usize,
 
@@ -190,6 +193,14 @@ impl VulkanApp {
             graphics_queue,
         );
 
+        let (index_buffer, index_buffer_memory) = Self::create_index_buffer(
+            &instance,
+            &device,
+            physical_device,
+            command_pool,
+            graphics_queue,
+        );
+
         let sync_objects = Self::create_sync_objects(&device, swapchain_images_len);
 
         Self {
@@ -219,6 +230,9 @@ impl VulkanApp {
 
             vertex_buffer,
             vertex_buffer_memory,
+
+            index_buffer,
+            index_buffer_memory,
 
             sync_objects,
             current_frame: 0,
@@ -767,7 +781,8 @@ impl VulkanApp {
                     vk::MemoryMapFlags::empty(),
                 )
                 .unwrap();
-            let mut align = ash::util::Align::new(data_ptr, align_of::<u32>() as _, buffer_size);
+            let mut align =
+                ash::util::Align::new(data_ptr, align_of_val(&VERTICES[0]) as _, buffer_size);
             align.copy_from_slice(&VERTICES);
             device.unmap_memory(staging_buffer_memory);
         }
@@ -796,6 +811,64 @@ impl VulkanApp {
         }
 
         (vertex_buffer, vertex_buffer_memory)
+    }
+
+    fn create_index_buffer(
+        instance: &Instance,
+        device: &Device,
+        physical_device: vk::PhysicalDevice,
+        command_pool: vk::CommandPool,
+        graphics_queue: vk::Queue,
+    ) -> (vk::Buffer, vk::DeviceMemory) {
+        let buffer_size = (size_of_val(&INDICES[0]) * INDICES.len()) as vk::DeviceSize;
+        let (staging_buffer, staging_buffer_memory) = Self::create_buffer(
+            instance,
+            device,
+            physical_device,
+            buffer_size,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        );
+
+        unsafe {
+            let data_ptr = device
+                .map_memory(
+                    staging_buffer_memory,
+                    0,
+                    buffer_size,
+                    vk::MemoryMapFlags::empty(),
+                )
+                .unwrap();
+            let mut align =
+                ash::util::Align::new(data_ptr, align_of_val(&INDICES[0]) as _, buffer_size);
+            align.copy_from_slice(&INDICES);
+            device.unmap_memory(staging_buffer_memory);
+        }
+
+        let (index_buffer, index_buffer_memory) = Self::create_buffer(
+            instance,
+            device,
+            physical_device,
+            buffer_size,
+            vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        );
+
+        Self::copy_buffer(
+            device,
+            command_pool,
+            graphics_queue,
+            staging_buffer,
+            index_buffer,
+            buffer_size,
+        );
+
+        unsafe {
+            device.destroy_buffer(staging_buffer, None);
+            device.free_memory(staging_buffer_memory, None);
+        }
+
+        (index_buffer, index_buffer_memory)
     }
 
     fn create_buffer(
@@ -910,6 +983,7 @@ impl VulkanApp {
         image_index: usize,
         pipeline: vk::Pipeline,
         vertex_buffer: vk::Buffer,
+        index_buffer: vk::Buffer,
     ) {
         unsafe {
             device
@@ -975,10 +1049,16 @@ impl VulkanApp {
         let vertex_buffers = &[vertex_buffer];
         let vertex_buffer_offsets = &[0];
         unsafe {
-            device.cmd_bind_vertex_buffers(command_buffer, 0, vertex_buffers, vertex_buffer_offsets)
-        };
+            device.cmd_bind_vertex_buffers(
+                command_buffer,
+                0,
+                vertex_buffers,
+                vertex_buffer_offsets,
+            );
+            device.cmd_bind_index_buffer(command_buffer, index_buffer, 0, vk::IndexType::UINT16);
+        }
 
-        unsafe { device.cmd_draw(command_buffer, 3, 1, 0, 0) };
+        unsafe { device.cmd_draw_indexed(command_buffer, INDICES.len() as _, 1, 0, 0, 0) };
 
         unsafe { device.cmd_end_rendering(command_buffer) };
 
@@ -1098,6 +1178,7 @@ impl VulkanApp {
             image_index as _,
             self.pipeline,
             self.vertex_buffer,
+            self.index_buffer,
         );
 
         // Submit
@@ -1201,6 +1282,9 @@ impl Drop for VulkanApp {
                 .iter()
                 .for_each(|o| o.destroy(&self.device));
 
+            self.device.free_memory(self.index_buffer_memory, None);
+            self.device.destroy_buffer(self.index_buffer, None);
+
             self.device.free_memory(self.vertex_buffer_memory, None);
             self.device.destroy_buffer(self.vertex_buffer, None);
 
@@ -1257,20 +1341,26 @@ struct Vertex {
     color: [f32; 3],
 }
 
-const VERTICES: [Vertex; 3] = [
+const VERTICES: [Vertex; 4] = [
     Vertex {
-        pos: [0.0, -0.5],
+        pos: [-0.5, -0.5],
         color: [1.0, 0.0, 0.0],
     },
     Vertex {
-        pos: [0.5, 0.5],
+        pos: [0.5, -0.5],
         color: [0.0, 1.0, 0.0],
     },
     Vertex {
-        pos: [-0.5, 0.5],
+        pos: [0.5, 0.5],
         color: [0.0, 0.0, 1.0],
     },
+    Vertex {
+        pos: [-0.5, 0.5],
+        color: [1.0, 1.0, 1.0],
+    },
 ];
+
+const INDICES: [u16; 6] = [0, 1, 2, 2, 3, 0];
 
 impl Vertex {
     fn get_binding_description() -> vk::VertexInputBindingDescription {
