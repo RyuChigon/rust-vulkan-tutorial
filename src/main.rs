@@ -1,8 +1,9 @@
 mod debug;
+mod math;
 mod swapchain_properties;
 
 use std::{
-    ffi::CStr,
+    ffi::{CStr, c_void},
     fs::File,
     io::{Cursor, Read},
     mem::offset_of,
@@ -14,6 +15,7 @@ use ash::{
     ext::debug_utils,
     vk::{self, DebugUtilsMessengerEXT},
 };
+use cgmath::{Deg, Matrix4, Point3, Vector3};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::{
     application::ApplicationHandler,
@@ -123,6 +125,7 @@ struct VulkanApp {
     swapchain_properties: SwapchainProperties,
     swapchain_image_views: Vec<vk::ImageView>,
 
+    descriptor_set_layout: vk::DescriptorSetLayout,
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
 
@@ -135,10 +138,16 @@ struct VulkanApp {
     index_buffer: vk::Buffer,
     index_buffer_memory: vk::DeviceMemory,
 
+    uniform_buffers: Vec<vk::Buffer>,
+    uniform_buffers_memories: Vec<vk::DeviceMemory>,
+    uniform_buffers_mapped_ptrs: Vec<*mut c_void>,
+
     sync_objects: Vec<SyncObjects>,
     current_frame: usize,
 
     dirty_swapchain: bool,
+
+    start_time_instant: std::time::Instant,
 }
 
 impl VulkanApp {
@@ -179,7 +188,10 @@ impl VulkanApp {
         let swapchain_image_views =
             Self::create_swapchain_image_views(&device, &swapchain_images, &swapchain_properties);
 
-        let (pipeline, pipeline_layout) = Self::create_pipeline(&device, &swapchain_properties);
+        let descriptor_set_layout = Self::create_descriptor_set_layout(&device);
+
+        let (pipeline, pipeline_layout) =
+            Self::create_pipeline(&device, &swapchain_properties, &[descriptor_set_layout]);
 
         let command_pool = Self::create_command_pool(&device, graphics_index);
         let command_buffers =
@@ -200,6 +212,9 @@ impl VulkanApp {
             command_pool,
             graphics_queue,
         );
+
+        let (uniform_buffers, uniform_buffers_memories, uniform_buffers_mapped_ptrs) =
+            Self::create_uniform_buffers(&instance, &device, physical_device, swapchain_images_len);
 
         let sync_objects = Self::create_sync_objects(&device, swapchain_images_len);
 
@@ -222,6 +237,7 @@ impl VulkanApp {
             swapchain_properties,
             swapchain_image_views,
 
+            descriptor_set_layout,
             pipeline_layout,
             pipeline,
 
@@ -234,10 +250,16 @@ impl VulkanApp {
             index_buffer,
             index_buffer_memory,
 
+            uniform_buffers,
+            uniform_buffers_memories,
+            uniform_buffers_mapped_ptrs,
+
             sync_objects,
             current_frame: 0,
 
             dirty_swapchain: false,
+
+            start_time_instant: std::time::Instant::now(),
         }
     }
 
@@ -601,9 +623,27 @@ impl VulkanApp {
             .collect::<Vec<_>>()
     }
 
+    fn create_descriptor_set_layout(device: &Device) -> vk::DescriptorSetLayout {
+        let descriptor_set_layout_bindings = &[vk::DescriptorSetLayoutBinding::default()
+            .binding(0)
+            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::VERTEX)];
+
+        let descriptor_set_layout_create_info =
+            vk::DescriptorSetLayoutCreateInfo::default().bindings(descriptor_set_layout_bindings);
+
+        unsafe {
+            device
+                .create_descriptor_set_layout(&descriptor_set_layout_create_info, None)
+                .unwrap()
+        }
+    }
+
     fn create_pipeline(
         device: &Device,
         swapchain_properties: &SwapchainProperties,
+        descriptor_set_layouts: &[vk::DescriptorSetLayout],
     ) -> (vk::Pipeline, vk::PipelineLayout) {
         let shader_code = Self::read_shader_from_file("shaders/shader.spv");
         let shader_module = Self::create_shader_module(device, &shader_code);
@@ -669,7 +709,8 @@ impl VulkanApp {
             .logic_op_enable(false)
             .attachments(color_blend_attachment);
 
-        let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default();
+        let pipeline_layout_info =
+            vk::PipelineLayoutCreateInfo::default().set_layouts(descriptor_set_layouts);
         let pipeline_layout = unsafe {
             device
                 .create_pipeline_layout(&pipeline_layout_info, None)
@@ -869,6 +910,46 @@ impl VulkanApp {
         }
 
         (index_buffer, index_buffer_memory)
+    }
+
+    fn create_uniform_buffers(
+        instance: &Instance,
+        device: &Device,
+        physical_device: vk::PhysicalDevice,
+        count: usize,
+    ) -> (Vec<vk::Buffer>, Vec<vk::DeviceMemory>, Vec<*mut c_void>) {
+        let buffer_size = size_of::<UniformBufferObject>() as u64;
+
+        let mut uniform_buffers = Vec::with_capacity(count);
+        let mut uniform_buffers_memories = Vec::with_capacity(count);
+        let mut uniform_buffers_mapped_ptrs = Vec::with_capacity(count);
+
+        for _ in 0..count {
+            let (buffer, memory) = Self::create_buffer(
+                instance,
+                device,
+                physical_device,
+                buffer_size,
+                vk::BufferUsageFlags::UNIFORM_BUFFER,
+                vk::MemoryPropertyFlags::HOST_COHERENT | vk::MemoryPropertyFlags::HOST_VISIBLE,
+            );
+
+            let mapped_ptr = unsafe {
+                device
+                    .map_memory(memory, 0, buffer_size, vk::MemoryMapFlags::empty())
+                    .unwrap()
+            };
+
+            uniform_buffers.push(buffer);
+            uniform_buffers_memories.push(memory);
+            uniform_buffers_mapped_ptrs.push(mapped_ptr);
+        }
+
+        (
+            uniform_buffers,
+            uniform_buffers_memories,
+            uniform_buffers_mapped_ptrs,
+        )
     }
 
     fn create_buffer(
@@ -1181,6 +1262,8 @@ impl VulkanApp {
             self.index_buffer,
         );
 
+        self.update_uniform_buffer(self.current_frame);
+
         // Submit
         {
             let wait_semaphores = &[present_complete_semaphore];
@@ -1234,6 +1317,32 @@ impl VulkanApp {
         false
     }
 
+    fn update_uniform_buffer(&mut self, current_image: usize) {
+        let time = self.start_time_instant.elapsed().as_secs_f32();
+
+        let aspect = self.swapchain_properties.aspect();
+
+        let model = Matrix4::from_angle_z(Deg(90.0 * time));
+        let view = Matrix4::look_at_rh(
+            Point3::new(2.0, 2.0, 2.0),
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+        );
+        let proj = math::perspective(Deg(45.0), aspect, 0.1, 10.0);
+
+        let ubos = [UniformBufferObject { model, view, proj }];
+
+        let mapped_ptr = self.uniform_buffers_mapped_ptrs[current_image];
+        let mut align = unsafe {
+            ash::util::Align::new(
+                mapped_ptr,
+                align_of::<UniformBufferObject>() as _,
+                size_of::<UniformBufferObject>() as _,
+            )
+        };
+        align.copy_from_slice(&ubos);
+    }
+
     fn recreate_swapchain(&mut self) {
         log::debug!("recreate swapchain");
         unsafe { self.device.device_wait_idle().unwrap() }
@@ -1282,6 +1391,14 @@ impl Drop for VulkanApp {
                 .iter()
                 .for_each(|o| o.destroy(&self.device));
 
+            self.uniform_buffers_memories.iter().for_each(|m| {
+                self.device.unmap_memory(*m);
+                self.device.free_memory(*m, None);
+            });
+            self.uniform_buffers
+                .iter()
+                .for_each(|b| self.device.destroy_buffer(*b, None));
+
             self.device.free_memory(self.index_buffer_memory, None);
             self.device.destroy_buffer(self.index_buffer, None);
 
@@ -1294,6 +1411,8 @@ impl Drop for VulkanApp {
             self.device.destroy_pipeline(self.pipeline, None);
             self.device
                 .destroy_pipeline_layout(self.pipeline_layout, None);
+            self.device
+                .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
 
             self.cleanup_swapchain();
 
@@ -1361,6 +1480,13 @@ const VERTICES: [Vertex; 4] = [
 ];
 
 const INDICES: [u16; 6] = [0, 1, 2, 2, 3, 0];
+
+#[derive(Clone, Copy)]
+struct UniformBufferObject {
+    model: Matrix4<f32>,
+    view: Matrix4<f32>,
+    proj: Matrix4<f32>,
+}
 
 impl Vertex {
     fn get_binding_description() -> vk::VertexInputBindingDescription {
