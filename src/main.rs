@@ -142,6 +142,9 @@ struct VulkanApp {
     uniform_buffers_memories: Vec<vk::DeviceMemory>,
     uniform_buffers_mapped_ptrs: Vec<*mut c_void>,
 
+    descriptor_pool: vk::DescriptorPool,
+    descriptor_sets: Vec<vk::DescriptorSet>,
+
     sync_objects: Vec<SyncObjects>,
     current_frame: usize,
 
@@ -216,6 +219,14 @@ impl VulkanApp {
         let (uniform_buffers, uniform_buffers_memories, uniform_buffers_mapped_ptrs) =
             Self::create_uniform_buffers(&instance, &device, physical_device, swapchain_images_len);
 
+        let descriptor_pool = Self::create_descriptor_pool(&device, swapchain_images_len);
+        let descriptor_sets = Self::create_descriptor_sets(
+            &device,
+            descriptor_pool,
+            descriptor_set_layout,
+            &uniform_buffers,
+        );
+
         let sync_objects = Self::create_sync_objects(&device, swapchain_images_len);
 
         Self {
@@ -253,6 +264,9 @@ impl VulkanApp {
             uniform_buffers,
             uniform_buffers_memories,
             uniform_buffers_mapped_ptrs,
+
+            descriptor_pool,
+            descriptor_sets,
 
             sync_objects,
             current_frame: 0,
@@ -682,7 +696,7 @@ impl VulkanApp {
             .rasterizer_discard_enable(false)
             .polygon_mode(vk::PolygonMode::FILL)
             .cull_mode(vk::CullModeFlags::BACK)
-            .front_face(vk::FrontFace::CLOCKWISE)
+            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
             .depth_bias_enable(false)
             .depth_bias_slope_factor(1.0)
             .line_width(1.0);
@@ -925,6 +939,10 @@ impl VulkanApp {
         let mut uniform_buffers_mapped_ptrs = Vec::with_capacity(count);
 
         for _ in 0..count {
+            // We're going to copy new data to the uniform buffer every frame, so it doesn't
+            // really make any sense to have a staging buffer. It would just add extra overhead
+            // in this case and likely degrade performance instead of improving it.
+
             let (buffer, memory) = Self::create_buffer(
                 instance,
                 device,
@@ -934,6 +952,7 @@ impl VulkanApp {
                 vk::MemoryPropertyFlags::HOST_COHERENT | vk::MemoryPropertyFlags::HOST_VISIBLE,
             );
 
+            // persistent mapping
             let mapped_ptr = unsafe {
                 device
                     .map_memory(memory, 0, buffer_size, vk::MemoryMapFlags::empty())
@@ -950,6 +969,63 @@ impl VulkanApp {
             uniform_buffers_memories,
             uniform_buffers_mapped_ptrs,
         )
+    }
+
+    fn create_descriptor_pool(device: &Device, count: usize) -> vk::DescriptorPool {
+        let descriptor_pool_sizes = &[vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::UNIFORM_BUFFER)
+            .descriptor_count(count as _)];
+
+        let descriptor_pool_create_info = vk::DescriptorPoolCreateInfo::default()
+            .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
+            .max_sets(count as _)
+            .pool_sizes(descriptor_pool_sizes);
+
+        unsafe {
+            device
+                .create_descriptor_pool(&descriptor_pool_create_info, None)
+                .unwrap()
+        }
+    }
+
+    fn create_descriptor_sets(
+        device: &Device,
+        descriptor_pool: vk::DescriptorPool,
+        descriptor_set_layout: vk::DescriptorSetLayout,
+        uniform_buffers: &[vk::Buffer],
+    ) -> Vec<vk::DescriptorSet> {
+        let layouts = (0..uniform_buffers.len())
+            .map(|_| descriptor_set_layout)
+            .collect::<Vec<_>>();
+        let descriptor_set_allocate_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(descriptor_pool)
+            .set_layouts(&layouts);
+
+        let descriptor_sets = unsafe {
+            device
+                .allocate_descriptor_sets(&descriptor_set_allocate_info)
+                .unwrap()
+        };
+
+        for (&descriptor_set, &uniform_buffer) in descriptor_sets.iter().zip(uniform_buffers) {
+            let descriptor_buffer_info = &[vk::DescriptorBufferInfo::default()
+                .buffer(uniform_buffer)
+                .offset(0)
+                .range(size_of::<UniformBufferObject>() as _)];
+
+            let write_descriptor_set = vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(0)
+                .dst_array_element(0)
+                .descriptor_count(1)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .buffer_info(descriptor_buffer_info);
+
+            let descriptor_copies = &[];
+            unsafe { device.update_descriptor_sets(&[write_descriptor_set], descriptor_copies) };
+        }
+
+        descriptor_sets
     }
 
     fn create_buffer(
@@ -1065,6 +1141,9 @@ impl VulkanApp {
         pipeline: vk::Pipeline,
         vertex_buffer: vk::Buffer,
         index_buffer: vk::Buffer,
+        pipeline_layout: vk::PipelineLayout,
+        descriptor_sets: &[vk::DescriptorSet],
+        current_frame: usize,
     ) {
         unsafe {
             device
@@ -1139,6 +1218,16 @@ impl VulkanApp {
             device.cmd_bind_index_buffer(command_buffer, index_buffer, 0, vk::IndexType::UINT16);
         }
 
+        unsafe {
+            device.cmd_bind_descriptor_sets(
+                command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                pipeline_layout,
+                0,
+                &[descriptor_sets[current_frame]],
+                &[],
+            )
+        };
         unsafe { device.cmd_draw_indexed(command_buffer, INDICES.len() as _, 1, 0, 0, 0) };
 
         unsafe { device.cmd_end_rendering(command_buffer) };
@@ -1260,6 +1349,9 @@ impl VulkanApp {
             self.pipeline,
             self.vertex_buffer,
             self.index_buffer,
+            self.pipeline_layout,
+            &self.descriptor_sets,
+            self.current_frame,
         );
 
         self.update_uniform_buffer(self.current_frame);
@@ -1391,6 +1483,9 @@ impl Drop for VulkanApp {
                 .iter()
                 .for_each(|o| o.destroy(&self.device));
 
+            self.device
+                .destroy_descriptor_pool(self.descriptor_pool, None);
+
             self.uniform_buffers_memories.iter().for_each(|m| {
                 self.device.unmap_memory(*m);
                 self.device.free_memory(*m, None);
@@ -1482,6 +1577,7 @@ const VERTICES: [Vertex; 4] = [
 const INDICES: [u16; 6] = [0, 1, 2, 2, 3, 0];
 
 #[derive(Clone, Copy)]
+#[allow(dead_code)]
 struct UniformBufferObject {
     model: Matrix4<f32>,
     view: Matrix4<f32>,
