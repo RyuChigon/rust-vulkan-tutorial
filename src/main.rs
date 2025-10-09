@@ -142,13 +142,13 @@ struct VulkanApp {
     uniform_buffers_memories: Vec<vk::DeviceMemory>,
     uniform_buffers_mapped_ptrs: Vec<*mut c_void>,
 
-    descriptor_pool: vk::DescriptorPool,
-    descriptor_sets: Vec<vk::DescriptorSet>,
-
     texture_image: vk::Image,
     texture_image_memory: vk::DeviceMemory,
     texture_image_view: vk::ImageView,
     texture_sampler: vk::Sampler,
+
+    descriptor_pool: vk::DescriptorPool,
+    descriptor_sets: Vec<vk::DescriptorSet>,
 
     sync_objects: Vec<SyncObjects>,
     current_frame: usize,
@@ -224,14 +224,6 @@ impl VulkanApp {
         let (uniform_buffers, uniform_buffers_memories, uniform_buffers_mapped_ptrs) =
             Self::create_uniform_buffers(&instance, &device, physical_device, swapchain_images_len);
 
-        let descriptor_pool = Self::create_descriptor_pool(&device, swapchain_images_len);
-        let descriptor_sets = Self::create_descriptor_sets(
-            &device,
-            descriptor_pool,
-            descriptor_set_layout,
-            &uniform_buffers,
-        );
-
         let (texture_image, texture_image_memory) = Self::create_texture_image(
             &instance,
             &device,
@@ -241,6 +233,16 @@ impl VulkanApp {
         );
         let texture_image_view = Self::create_texture_image_view(&device, texture_image);
         let texture_sampler = Self::create_texture_sampler(&device, &instance, physical_device);
+
+        let descriptor_pool = Self::create_descriptor_pool(&device, swapchain_images_len);
+        let descriptor_sets = Self::create_descriptor_sets(
+            &device,
+            descriptor_pool,
+            descriptor_set_layout,
+            &uniform_buffers,
+            texture_image_view,
+            texture_sampler,
+        );
 
         let sync_objects = Self::create_sync_objects(&device, swapchain_images_len);
 
@@ -280,13 +282,13 @@ impl VulkanApp {
             uniform_buffers_memories,
             uniform_buffers_mapped_ptrs,
 
-            descriptor_pool,
-            descriptor_sets,
-
             texture_image,
             texture_image_memory,
             texture_image_view,
             texture_sampler,
+
+            descriptor_pool,
+            descriptor_sets,
 
             sync_objects,
             current_frame: 0,
@@ -652,11 +654,18 @@ impl VulkanApp {
     }
 
     fn create_descriptor_set_layout(device: &Device) -> vk::DescriptorSetLayout {
-        let descriptor_set_layout_bindings = &[vk::DescriptorSetLayoutBinding::default()
-            .binding(0)
-            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-            .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::VERTEX)];
+        let descriptor_set_layout_bindings = &[
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::VERTEX),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        ];
 
         let descriptor_set_layout_create_info =
             vk::DescriptorSetLayoutCreateInfo::default().bindings(descriptor_set_layout_bindings);
@@ -832,9 +841,10 @@ impl VulkanApp {
         queue: vk::Queue,
     ) -> (vk::Image, vk::DeviceMemory) {
         let image = image::open("textures/texture.jpg").unwrap();
-        let pixels = image.as_bytes();
-        let (width, height) = (image.width(), image.height());
-        let image_size = (width * height * 4) as vk::DeviceSize;
+        let image_as_rgb = image.to_rgba8();
+        let (width, height) = (image_as_rgb.width(), image_as_rgb.height());
+        let pixels = image_as_rgb.into_raw();
+        let image_size = (pixels.len() * size_of::<u8>()) as vk::DeviceSize;
         let (staging_buffer, staging_buffer_memory) = Self::create_buffer(
             instance,
             device,
@@ -854,7 +864,7 @@ impl VulkanApp {
                 )
                 .unwrap();
             let mut align = ash::util::Align::new(data_ptr, align_of::<u8>() as _, image_size);
-            align.copy_from_slice(pixels);
+            align.copy_from_slice(&pixels);
             device.unmap_memory(staging_buffer_memory);
         }
 
@@ -1167,9 +1177,14 @@ impl VulkanApp {
     }
 
     fn create_descriptor_pool(device: &Device, count: usize) -> vk::DescriptorPool {
-        let descriptor_pool_sizes = &[vk::DescriptorPoolSize::default()
-            .ty(vk::DescriptorType::UNIFORM_BUFFER)
-            .descriptor_count(count as _)];
+        let descriptor_pool_sizes = &[
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_count(count as _),
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(count as _),
+        ];
 
         let descriptor_pool_create_info = vk::DescriptorPoolCreateInfo::default()
             .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
@@ -1188,6 +1203,8 @@ impl VulkanApp {
         descriptor_pool: vk::DescriptorPool,
         descriptor_set_layout: vk::DescriptorSetLayout,
         uniform_buffers: &[vk::Buffer],
+        texture_image_view: vk::ImageView,
+        texture_sampler: vk::Sampler,
     ) -> Vec<vk::DescriptorSet> {
         let layouts = (0..uniform_buffers.len())
             .map(|_| descriptor_set_layout)
@@ -1208,16 +1225,30 @@ impl VulkanApp {
                 .offset(0)
                 .range(size_of::<UniformBufferObject>() as _)];
 
-            let write_descriptor_set = vk::WriteDescriptorSet::default()
-                .dst_set(descriptor_set)
-                .dst_binding(0)
-                .dst_array_element(0)
-                .descriptor_count(1)
-                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-                .buffer_info(descriptor_buffer_info);
+            let descriptor_image_info = &[vk::DescriptorImageInfo::default()
+                .sampler(texture_sampler)
+                .image_view(texture_image_view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+
+            let write_descriptor_set = &[
+                vk::WriteDescriptorSet::default()
+                    .dst_set(descriptor_set)
+                    .dst_binding(0)
+                    .dst_array_element(0)
+                    .descriptor_count(1)
+                    .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                    .buffer_info(descriptor_buffer_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(descriptor_set)
+                    .dst_binding(1)
+                    .dst_array_element(0)
+                    .descriptor_count(1)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(descriptor_image_info),
+            ];
 
             let descriptor_copies = &[];
-            unsafe { device.update_descriptor_sets(&[write_descriptor_set], descriptor_copies) };
+            unsafe { device.update_descriptor_sets(write_descriptor_set, descriptor_copies) };
         }
 
         descriptor_sets
@@ -1787,14 +1818,14 @@ impl Drop for VulkanApp {
                 .iter()
                 .for_each(|o| o.destroy(&self.device));
 
+            self.device
+                .destroy_descriptor_pool(self.descriptor_pool, None);
+
             self.device.destroy_sampler(self.texture_sampler, None);
             self.device
                 .destroy_image_view(self.texture_image_view, None);
             self.device.free_memory(self.texture_image_memory, None);
             self.device.destroy_image(self.texture_image, None);
-
-            self.device
-                .destroy_descriptor_pool(self.descriptor_pool, None);
 
             self.uniform_buffers_memories.iter().for_each(|m| {
                 self.device.unmap_memory(*m);
@@ -1863,24 +1894,29 @@ impl SyncObjects {
 struct Vertex {
     pos: [f32; 2],
     color: [f32; 3],
+    tex_coord: [f32; 2],
 }
 
 const VERTICES: [Vertex; 4] = [
     Vertex {
         pos: [-0.5, -0.5],
         color: [1.0, 0.0, 0.0],
+        tex_coord: [1.0, 0.0],
     },
     Vertex {
         pos: [0.5, -0.5],
         color: [0.0, 1.0, 0.0],
+        tex_coord: [0.0, 0.0],
     },
     Vertex {
         pos: [0.5, 0.5],
         color: [0.0, 0.0, 1.0],
+        tex_coord: [0.0, 1.0],
     },
     Vertex {
         pos: [-0.5, 0.5],
         color: [1.0, 1.0, 1.0],
+        tex_coord: [1.0, 1.0],
     },
 ];
 
@@ -1902,7 +1938,7 @@ impl Vertex {
             .input_rate(vk::VertexInputRate::VERTEX)
     }
 
-    fn get_attribute_descriptions() -> [vk::VertexInputAttributeDescription; 2] {
+    fn get_attribute_descriptions() -> [vk::VertexInputAttributeDescription; 3] {
         [
             vk::VertexInputAttributeDescription::default()
                 .location(0)
@@ -1914,6 +1950,11 @@ impl Vertex {
                 .binding(0)
                 .format(vk::Format::R32G32B32_SFLOAT)
                 .offset(offset_of!(Vertex, color) as _),
+            vk::VertexInputAttributeDescription::default()
+                .location(2)
+                .binding(0)
+                .format(vk::Format::R32G32_SFLOAT)
+                .offset(offset_of!(Vertex, tex_coord) as _),
         ]
     }
 }
