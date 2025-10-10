@@ -142,6 +142,10 @@ struct VulkanApp {
     uniform_buffers_memories: Vec<vk::DeviceMemory>,
     uniform_buffers_mapped_ptrs: Vec<*mut c_void>,
 
+    depth_image: vk::Image,
+    depth_image_memory: vk::DeviceMemory,
+    depth_image_view: vk::ImageView,
+
     texture_image: vk::Image,
     texture_image_memory: vk::DeviceMemory,
     texture_image_view: vk::ImageView,
@@ -198,8 +202,13 @@ impl VulkanApp {
 
         let descriptor_set_layout = Self::create_descriptor_set_layout(&device);
 
-        let (pipeline, pipeline_layout) =
-            Self::create_pipeline(&device, &swapchain_properties, &[descriptor_set_layout]);
+        let depth_format = Self::find_depth_format(&instance, physical_device);
+        let (pipeline, pipeline_layout) = Self::create_pipeline(
+            &device,
+            &swapchain_properties,
+            &[descriptor_set_layout],
+            depth_format,
+        );
 
         let command_pool = Self::create_command_pool(&device, graphics_index);
         let command_buffers =
@@ -223,6 +232,13 @@ impl VulkanApp {
 
         let (uniform_buffers, uniform_buffers_memories, uniform_buffers_mapped_ptrs) =
             Self::create_uniform_buffers(&instance, &device, physical_device, swapchain_images_len);
+
+        let (depth_image, depth_image_memory, depth_image_view) = Self::create_depth_resources(
+            &device,
+            &instance,
+            physical_device,
+            &swapchain_properties,
+        );
 
         let (texture_image, texture_image_memory) = Self::create_texture_image(
             &instance,
@@ -281,6 +297,10 @@ impl VulkanApp {
             uniform_buffers,
             uniform_buffers_memories,
             uniform_buffers_mapped_ptrs,
+
+            depth_image,
+            depth_image_memory,
+            depth_image_view,
 
             texture_image,
             texture_image_memory,
@@ -648,7 +668,12 @@ impl VulkanApp {
         swapchain_images
             .iter()
             .map(|image| {
-                Self::create_image_view(device, *image, swapchain_properties.format.format)
+                Self::create_image_view(
+                    device,
+                    *image,
+                    swapchain_properties.format.format,
+                    vk::ImageAspectFlags::COLOR,
+                )
             })
             .collect::<Vec<_>>()
     }
@@ -681,6 +706,7 @@ impl VulkanApp {
         device: &Device,
         swapchain_properties: &SwapchainProperties,
         descriptor_set_layouts: &[vk::DescriptorSetLayout],
+        depth_format: vk::Format,
     ) -> (vk::Pipeline, vk::PipelineLayout) {
         let shader_code = Self::read_shader_from_file("shaders/shader.spv");
         let shader_module = Self::create_shader_module(device, &shader_code);
@@ -729,7 +755,14 @@ impl VulkanApp {
             .rasterization_samples(vk::SampleCountFlags::TYPE_1)
             .sample_shading_enable(false);
 
-        // TODO: Depth and stencil testing
+        let depth_stencil_info = vk::PipelineDepthStencilStateCreateInfo::default()
+            .depth_test_enable(true)
+            .depth_write_enable(true)
+            .depth_compare_op(vk::CompareOp::LESS)
+            .depth_bounds_test_enable(false)
+            .min_depth_bounds(0.0)
+            .max_depth_bounds(1.0)
+            .stencil_test_enable(false);
 
         // Alpha blending
         let color_blend_attachment = vk::PipelineColorBlendAttachmentState::default()
@@ -755,9 +788,10 @@ impl VulkanApp {
         };
 
         // Dynamic rendering
-        let format = &[swapchain_properties.format.format];
-        let mut rendering_info =
-            vk::PipelineRenderingCreateInfo::default().color_attachment_formats(format);
+        let color_formats = &[swapchain_properties.format.format];
+        let mut rendering_info = vk::PipelineRenderingCreateInfo::default()
+            .color_attachment_formats(color_formats)
+            .depth_attachment_format(depth_format);
 
         let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
             .push_next(&mut rendering_info)
@@ -767,6 +801,7 @@ impl VulkanApp {
             .viewport_state(&viewport_info)
             .rasterization_state(&rasterization_info)
             .multisample_state(&multisampling_info)
+            .depth_stencil_state(&depth_stencil_info)
             .color_blend_state(&color_blend_info)
             .dynamic_state(&dynamic_state_info)
             .layout(pipeline_layout)
@@ -831,6 +866,85 @@ impl VulkanApp {
                 .allocate_command_buffers(&command_buffer_allocate_info)
                 .unwrap()
         }
+    }
+
+    fn create_depth_resources(
+        device: &Device,
+        instance: &Instance,
+        physical_device: vk::PhysicalDevice,
+        swapchain_properties: &SwapchainProperties,
+    ) -> (vk::Image, vk::DeviceMemory, vk::ImageView) {
+        let depth_format = Self::find_depth_format(instance, physical_device);
+
+        let (image, image_memory) = Self::create_image(
+            device,
+            instance,
+            physical_device,
+            swapchain_properties.extent.width,
+            swapchain_properties.extent.height,
+            depth_format,
+            vk::ImageTiling::OPTIMAL,
+            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        );
+
+        let image_view =
+            Self::create_image_view(device, image, depth_format, vk::ImageAspectFlags::DEPTH);
+
+        (image, image_memory, image_view)
+    }
+
+    fn find_depth_format(instance: &Instance, physical_device: vk::PhysicalDevice) -> vk::Format {
+        Self::find_supported_format(
+            instance,
+            physical_device,
+            &[
+                vk::Format::D32_SFLOAT,
+                vk::Format::D32_SFLOAT_S8_UINT,
+                vk::Format::D24_UNORM_S8_UINT,
+            ],
+            vk::ImageTiling::OPTIMAL,
+            vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT,
+        )
+    }
+
+    #[allow(dead_code)]
+    fn has_stencil_component(format: vk::Format) -> bool {
+        format == vk::Format::D32_SFLOAT_S8_UINT || format == vk::Format::D24_UNORM_S8_UINT
+    }
+
+    fn find_supported_format(
+        instance: &Instance,
+        physical_device: vk::PhysicalDevice,
+        candidates: &[vk::Format],
+        tiling: vk::ImageTiling,
+        format_features: vk::FormatFeatureFlags,
+    ) -> vk::Format {
+        for &format in candidates {
+            let format_properties =
+                unsafe { instance.get_physical_device_format_properties(physical_device, format) };
+            log::info!("format: {:?}", format);
+            log::info!("format_properties: {:?}", format_properties);
+
+            if tiling == vk::ImageTiling::LINEAR
+                && format_properties
+                    .linear_tiling_features
+                    .contains(format_features)
+            {
+                return format;
+            }
+
+            if tiling == vk::ImageTiling::OPTIMAL
+                && format_properties
+                    .optimal_tiling_features
+                    .contains(format_features)
+            {
+                log::info!("Selected format: {:?}", format);
+                return format;
+            }
+        }
+
+        panic!("failed to find supported format!")
     }
 
     fn create_texture_image(
@@ -915,7 +1029,12 @@ impl VulkanApp {
     }
 
     fn create_texture_image_view(device: &Device, image: vk::Image) -> vk::ImageView {
-        Self::create_image_view(device, image, vk::Format::R8G8B8A8_SRGB)
+        Self::create_image_view(
+            device,
+            image,
+            vk::Format::R8G8B8A8_SRGB,
+            vk::ImageAspectFlags::COLOR,
+        )
     }
 
     fn create_texture_sampler(
@@ -995,13 +1114,18 @@ impl VulkanApp {
         (image, memory)
     }
 
-    fn create_image_view(device: &Device, image: vk::Image, format: vk::Format) -> vk::ImageView {
+    fn create_image_view(
+        device: &Device,
+        image: vk::Image,
+        format: vk::Format,
+        aspect_mask: vk::ImageAspectFlags,
+    ) -> vk::ImageView {
         let image_view_create_info = vk::ImageViewCreateInfo::default()
             .image(image)
             .view_type(vk::ImageViewType::TYPE_2D)
             .format(format)
             .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
+                aspect_mask,
                 base_mip_level: 0,
                 level_count: 1,
                 base_array_layer: 0,
@@ -1343,6 +1467,8 @@ impl VulkanApp {
         pipeline_layout: vk::PipelineLayout,
         descriptor_sets: &[vk::DescriptorSet],
         current_frame: usize,
+        depth_image: vk::Image,
+        depth_image_view: vk::ImageView,
     ) {
         unsafe {
             device
@@ -1362,27 +1488,69 @@ impl VulkanApp {
             vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
         );
 
+        let depth_image_memory_barriers = &[vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
+            .src_access_mask(vk::AccessFlags2::empty())
+            .dst_stage_mask(
+                vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                    | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+            )
+            .dst_access_mask(
+                vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ_KHR
+                    | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            )
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .new_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(depth_image)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::DEPTH,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            })];
+
+        let depth_dependency_info =
+            vk::DependencyInfo::default().image_memory_barriers(depth_image_memory_barriers);
+
+        unsafe { device.cmd_pipeline_barrier2(command_buffer, &depth_dependency_info) };
+
         let clear_color = vk::ClearValue {
             color: vk::ClearColorValue {
                 float32: [0.0, 0.0, 0.0, 1.0],
             },
         };
+        let clear_depth = vk::ClearValue {
+            depth_stencil: vk::ClearDepthStencilValue {
+                depth: 1.0,
+                stencil: 0,
+            },
+        };
 
-        let rendering_attachment_info = vk::RenderingAttachmentInfo::default()
+        let color_attachment_info = vk::RenderingAttachmentInfo::default()
             .image_view(swapchain_image_views[image_index])
             .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
             .load_op(vk::AttachmentLoadOp::CLEAR)
             .store_op(vk::AttachmentStoreOp::STORE)
             .clear_value(clear_color);
+        let depth_attachment_info = vk::RenderingAttachmentInfo::default()
+            .image_view(depth_image_view)
+            .image_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .store_op(vk::AttachmentStoreOp::DONT_CARE)
+            .clear_value(clear_depth);
 
-        let rendering_attachment_infos = &[rendering_attachment_info];
+        let color_attachment_infos = &[color_attachment_info];
         let rendering_info = vk::RenderingInfo::default()
             .render_area(vk::Rect2D {
                 offset: vk::Offset2D { x: 0, y: 0 },
                 extent: swapchain_properties.extent,
             })
             .layer_count(1)
-            .color_attachments(rendering_attachment_infos);
+            .color_attachments(color_attachment_infos)
+            .depth_attachment(&depth_attachment_info);
 
         unsafe { device.cmd_begin_rendering(command_buffer, &rendering_info) };
 
@@ -1687,6 +1855,8 @@ impl VulkanApp {
             self.pipeline_layout,
             &self.descriptor_sets,
             self.current_frame,
+            self.depth_image,
+            self.depth_image_view,
         );
 
         self.update_uniform_buffer(self.current_frame);
@@ -1793,15 +1963,30 @@ impl VulkanApp {
             &swapchain_properties,
         );
 
+        let (depth_image, depth_image_memory, depth_image_view) = Self::create_depth_resources(
+            &self.device,
+            &self.instance,
+            self.physical_device,
+            &swapchain_properties,
+        );
+
         self.swapchain_device = swapchain_device;
         self.swapchain_khr = swapchain_khr;
         self.swapchain_images = swapchain_images;
         self.swapchain_properties = swapchain_properties;
         self.swapchain_image_views = swapchain_image_views;
+
+        self.depth_image = depth_image;
+        self.depth_image_memory = depth_image_memory;
+        self.depth_image_view = depth_image_view;
     }
 
     fn cleanup_swapchain(&mut self) {
         unsafe {
+            self.device.destroy_image_view(self.depth_image_view, None);
+            self.device.free_memory(self.depth_image_memory, None);
+            self.device.destroy_image(self.depth_image, None);
+
             self.swapchain_image_views
                 .iter()
                 .for_each(|iv| self.device.destroy_image_view(*iv, None));
@@ -1826,6 +2011,10 @@ impl Drop for VulkanApp {
                 .destroy_image_view(self.texture_image_view, None);
             self.device.free_memory(self.texture_image_memory, None);
             self.device.destroy_image(self.texture_image, None);
+
+            self.device.destroy_image_view(self.depth_image_view, None);
+            self.device.free_memory(self.depth_image_memory, None);
+            self.device.destroy_image(self.depth_image, None);
 
             self.uniform_buffers_memories.iter().for_each(|m| {
                 self.device.unmap_memory(*m);
@@ -1892,35 +2081,60 @@ impl SyncObjects {
 
 #[derive(Clone, Copy)]
 struct Vertex {
-    pos: [f32; 2],
+    pos: [f32; 3],
     color: [f32; 3],
     tex_coord: [f32; 2],
 }
 
-const VERTICES: [Vertex; 4] = [
+const VERTICES: [Vertex; 8] = [
     Vertex {
-        pos: [-0.5, -0.5],
+        pos: [-0.5, -0.5, 0.0],
         color: [1.0, 0.0, 0.0],
         tex_coord: [1.0, 0.0],
     },
     Vertex {
-        pos: [0.5, -0.5],
+        pos: [0.5, -0.5, 0.0],
         color: [0.0, 1.0, 0.0],
         tex_coord: [0.0, 0.0],
     },
     Vertex {
-        pos: [0.5, 0.5],
+        pos: [0.5, 0.5, 0.0],
         color: [0.0, 0.0, 1.0],
         tex_coord: [0.0, 1.0],
     },
     Vertex {
-        pos: [-0.5, 0.5],
+        pos: [-0.5, 0.5, 0.0],
+        color: [1.0, 1.0, 1.0],
+        tex_coord: [1.0, 1.0],
+    },
+    // Other square
+    Vertex {
+        pos: [-0.5, -0.5, -0.5],
+        color: [1.0, 0.0, 0.0],
+        tex_coord: [1.0, 0.0],
+    },
+    Vertex {
+        pos: [0.5, -0.5, -0.5],
+        color: [0.0, 1.0, 0.0],
+        tex_coord: [0.0, 0.0],
+    },
+    Vertex {
+        pos: [0.5, 0.5, -0.5],
+        color: [0.0, 0.0, 1.0],
+        tex_coord: [0.0, 1.0],
+    },
+    Vertex {
+        pos: [-0.5, 0.5, -0.5],
         color: [1.0, 1.0, 1.0],
         tex_coord: [1.0, 1.0],
     },
 ];
 
-const INDICES: [u16; 6] = [0, 1, 2, 2, 3, 0];
+#[cfg_attr(rustfmt, rustfmt_skip)]
+const INDICES: [u16; 12] = [
+    0, 1, 2, 2, 3, 0,
+    4, 5, 6, 6, 7, 4,
+];
 
 #[derive(Clone, Copy)]
 #[allow(dead_code)]
@@ -1943,7 +2157,7 @@ impl Vertex {
             vk::VertexInputAttributeDescription::default()
                 .location(0)
                 .binding(0)
-                .format(vk::Format::R32G32_SFLOAT)
+                .format(vk::Format::R32G32B32_SFLOAT)
                 .offset(offset_of!(Vertex, pos) as _),
             vk::VertexInputAttributeDescription::default()
                 .location(1)
