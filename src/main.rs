@@ -3,8 +3,10 @@ mod math;
 mod swapchain_properties;
 
 use std::{
+    collections::HashMap,
     ffi::{CStr, c_void},
     fs::File,
+    hash::{Hash, Hasher},
     io::{Cursor, Read},
     mem::offset_of,
     u64,
@@ -17,6 +19,7 @@ use ash::{
 };
 use cgmath::{Deg, Matrix4, Point3, Vector3};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+use tobj::LoadOptions;
 use winit::{
     application::ApplicationHandler,
     dpi::PhysicalSize,
@@ -132,6 +135,9 @@ struct VulkanApp {
     command_pool: vk::CommandPool,
     command_buffers: Vec<vk::CommandBuffer>,
 
+    _vertices: Vec<Vertex>,
+    indices: Vec<u32>,
+
     vertex_buffer: vk::Buffer,
     vertex_buffer_memory: vk::DeviceMemory,
 
@@ -214,12 +220,15 @@ impl VulkanApp {
         let command_buffers =
             Self::create_command_buffers(&device, command_pool, swapchain_images_len);
 
+        let (vertices, indices) = Self::load_model();
+
         let (vertex_buffer, vertex_buffer_memory) = Self::create_vertex_buffer(
             &instance,
             &device,
             physical_device,
             command_pool,
             graphics_queue,
+            &vertices,
         );
 
         let (index_buffer, index_buffer_memory) = Self::create_index_buffer(
@@ -228,6 +237,7 @@ impl VulkanApp {
             physical_device,
             command_pool,
             graphics_queue,
+            &indices,
         );
 
         let (uniform_buffers, uniform_buffers_memories, uniform_buffers_mapped_ptrs) =
@@ -287,6 +297,9 @@ impl VulkanApp {
 
             command_pool,
             command_buffers,
+
+            _vertices: vertices,
+            indices,
 
             vertex_buffer,
             vertex_buffer_memory,
@@ -954,7 +967,7 @@ impl VulkanApp {
         command_pool: vk::CommandPool,
         queue: vk::Queue,
     ) -> (vk::Image, vk::DeviceMemory) {
-        let image = image::open("textures/texture.jpg").unwrap();
+        let image = image::open("textures/viking_room.png").unwrap();
         let image_as_rgb = image.to_rgba8();
         let (width, height) = (image_as_rgb.width(), image_as_rgb.height());
         let pixels = image_as_rgb.into_raw();
@@ -1145,8 +1158,9 @@ impl VulkanApp {
         physical_device: vk::PhysicalDevice,
         command_pool: vk::CommandPool,
         graphics_queue: vk::Queue,
+        vertices: &[Vertex],
     ) -> (vk::Buffer, vk::DeviceMemory) {
-        let buffer_size = (size_of::<Vertex>() * VERTICES.len()) as vk::DeviceSize;
+        let buffer_size = (size_of::<Vertex>() * vertices.len()) as vk::DeviceSize;
         let (staging_buffer, staging_buffer_memory) = Self::create_buffer(
             instance,
             device,
@@ -1166,8 +1180,8 @@ impl VulkanApp {
                 )
                 .unwrap();
             let mut align =
-                ash::util::Align::new(data_ptr, align_of_val(&VERTICES[0]) as _, buffer_size);
-            align.copy_from_slice(&VERTICES);
+                ash::util::Align::new(data_ptr, align_of_val(&vertices[0]) as _, buffer_size);
+            align.copy_from_slice(&vertices);
             device.unmap_memory(staging_buffer_memory);
         }
 
@@ -1203,8 +1217,9 @@ impl VulkanApp {
         physical_device: vk::PhysicalDevice,
         command_pool: vk::CommandPool,
         graphics_queue: vk::Queue,
+        indices: &[u32],
     ) -> (vk::Buffer, vk::DeviceMemory) {
-        let buffer_size = (size_of_val(&INDICES[0]) * INDICES.len()) as vk::DeviceSize;
+        let buffer_size = (size_of_val(&indices[0]) * indices.len()) as vk::DeviceSize;
         let (staging_buffer, staging_buffer_memory) = Self::create_buffer(
             instance,
             device,
@@ -1224,8 +1239,8 @@ impl VulkanApp {
                 )
                 .unwrap();
             let mut align =
-                ash::util::Align::new(data_ptr, align_of_val(&INDICES[0]) as _, buffer_size);
-            align.copy_from_slice(&INDICES);
+                ash::util::Align::new(data_ptr, align_of_val(&indices[0]) as _, buffer_size);
+            align.copy_from_slice(&indices);
             device.unmap_memory(staging_buffer_memory);
         }
 
@@ -1469,6 +1484,7 @@ impl VulkanApp {
         current_frame: usize,
         depth_image: vk::Image,
         depth_image_view: vk::ImageView,
+        indices: &[u32],
     ) {
         unsafe {
             device
@@ -1564,7 +1580,7 @@ impl VulkanApp {
             width: swapchain_properties.extent.width as _,
             height: swapchain_properties.extent.height as _,
             min_depth: 0.0,
-            max_depth: 0.0,
+            max_depth: 1.0,
         };
         let scissor = vk::Rect2D {
             offset: vk::Offset2D::default(),
@@ -1582,7 +1598,7 @@ impl VulkanApp {
                 vertex_buffers,
                 vertex_buffer_offsets,
             );
-            device.cmd_bind_index_buffer(command_buffer, index_buffer, 0, vk::IndexType::UINT16);
+            device.cmd_bind_index_buffer(command_buffer, index_buffer, 0, vk::IndexType::UINT32);
         }
 
         unsafe {
@@ -1595,7 +1611,7 @@ impl VulkanApp {
                 &[],
             )
         };
-        unsafe { device.cmd_draw_indexed(command_buffer, INDICES.len() as _, 1, 0, 0, 0) };
+        unsafe { device.cmd_draw_indexed(command_buffer, indices.len() as _, 1, 0, 0, 0) };
 
         unsafe { device.cmd_end_rendering(command_buffer) };
 
@@ -1857,6 +1873,7 @@ impl VulkanApp {
             self.current_frame,
             self.depth_image,
             self.depth_image_view,
+            &self.indices,
         );
 
         self.update_uniform_buffer(self.current_frame);
@@ -1938,6 +1955,72 @@ impl VulkanApp {
             )
         };
         align.copy_from_slice(&ubos);
+    }
+
+    fn load_model() -> (Vec<Vertex>, Vec<u32>) {
+        let (models, _) = tobj::load_obj(
+            "models/viking_room.obj",
+            &LoadOptions {
+                triangulate: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+
+        {
+            let vertex_count = models
+                .iter()
+                .map(|m| m.mesh.positions.len() / 3)
+                .sum::<usize>();
+            let index_count = models.iter().map(|m| m.mesh.indices.len()).sum::<usize>();
+            log::info!(
+                "Before deduplicating, vertices len: {}, indices len: {}",
+                vertex_count,
+                index_count
+            );
+        }
+
+        let mut unique_vertices = HashMap::new();
+
+        for mesh in models.iter().map(|m| &m.mesh) {
+            for index in &mesh.indices {
+                let pos_offset = (3 * index) as usize;
+                let tex_coord_offset = (2 * index) as usize;
+
+                let vertex = Vertex {
+                    pos: [
+                        mesh.positions[pos_offset],
+                        mesh.positions[pos_offset + 1],
+                        mesh.positions[pos_offset + 2],
+                    ],
+                    color: [1.0, 1.0, 1.0],
+                    tex_coord: [
+                        mesh.texcoords[tex_coord_offset],
+                        1.0 - mesh.texcoords[tex_coord_offset + 1],
+                    ],
+                };
+
+                if let Some(index) = unique_vertices.get(&vertex) {
+                    indices.push(*index as u32);
+                } else {
+                    let index = vertices.len();
+                    unique_vertices.insert(vertex, index);
+                    vertices.push(vertex);
+                    indices.push(index as u32);
+                }
+            }
+        }
+
+        log::info!(
+            "After deduplicating, vertices len: {}, indices len: {}",
+            vertices.len(),
+            indices.len()
+        );
+
+        (vertices, indices)
     }
 
     fn recreate_swapchain(&mut self) {
@@ -2086,56 +2169,6 @@ struct Vertex {
     tex_coord: [f32; 2],
 }
 
-const VERTICES: [Vertex; 8] = [
-    Vertex {
-        pos: [-0.5, -0.5, 0.0],
-        color: [1.0, 0.0, 0.0],
-        tex_coord: [1.0, 0.0],
-    },
-    Vertex {
-        pos: [0.5, -0.5, 0.0],
-        color: [0.0, 1.0, 0.0],
-        tex_coord: [0.0, 0.0],
-    },
-    Vertex {
-        pos: [0.5, 0.5, 0.0],
-        color: [0.0, 0.0, 1.0],
-        tex_coord: [0.0, 1.0],
-    },
-    Vertex {
-        pos: [-0.5, 0.5, 0.0],
-        color: [1.0, 1.0, 1.0],
-        tex_coord: [1.0, 1.0],
-    },
-    // Other square
-    Vertex {
-        pos: [-0.5, -0.5, -0.5],
-        color: [1.0, 0.0, 0.0],
-        tex_coord: [1.0, 0.0],
-    },
-    Vertex {
-        pos: [0.5, -0.5, -0.5],
-        color: [0.0, 1.0, 0.0],
-        tex_coord: [0.0, 0.0],
-    },
-    Vertex {
-        pos: [0.5, 0.5, -0.5],
-        color: [0.0, 0.0, 1.0],
-        tex_coord: [0.0, 1.0],
-    },
-    Vertex {
-        pos: [-0.5, 0.5, -0.5],
-        color: [1.0, 1.0, 1.0],
-        tex_coord: [1.0, 1.0],
-    },
-];
-
-#[cfg_attr(rustfmt, rustfmt_skip)]
-const INDICES: [u16; 12] = [
-    0, 1, 2, 2, 3, 0,
-    4, 5, 6, 6, 7, 4,
-];
-
 #[derive(Clone, Copy)]
 #[allow(dead_code)]
 struct UniformBufferObject {
@@ -2170,5 +2203,26 @@ impl Vertex {
                 .format(vk::Format::R32G32_SFLOAT)
                 .offset(offset_of!(Vertex, tex_coord) as _),
         ]
+    }
+}
+
+impl PartialEq for Vertex {
+    fn eq(&self, other: &Self) -> bool {
+        self.pos == other.pos && self.color == other.color && self.tex_coord == other.tex_coord
+    }
+}
+
+impl Eq for Vertex {}
+
+impl Hash for Vertex {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.pos[0].to_bits().hash(state);
+        self.pos[1].to_bits().hash(state);
+        self.pos[2].to_bits().hash(state);
+        self.color[0].to_bits().hash(state);
+        self.color[1].to_bits().hash(state);
+        self.color[2].to_bits().hash(state);
+        self.tex_coord[0].to_bits().hash(state);
+        self.tex_coord[1].to_bits().hash(state);
     }
 }
