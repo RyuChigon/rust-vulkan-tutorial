@@ -250,14 +250,15 @@ impl VulkanApp {
             &swapchain_properties,
         );
 
-        let (texture_image, texture_image_memory) = Self::create_texture_image(
+        let (texture_image, texture_image_memory, mip_levels) = Self::create_texture_image(
             &instance,
             &device,
             physical_device,
             command_pool,
             graphics_queue,
         );
-        let texture_image_view = Self::create_texture_image_view(&device, texture_image);
+        let texture_image_view =
+            Self::create_texture_image_view(&device, texture_image, mip_levels);
         let texture_sampler = Self::create_texture_sampler(&device, &instance, physical_device);
 
         let descriptor_pool = Self::create_descriptor_pool(&device, swapchain_images_len);
@@ -686,6 +687,7 @@ impl VulkanApp {
                     *image,
                     swapchain_properties.format.format,
                     vk::ImageAspectFlags::COLOR,
+                    1,
                 )
             })
             .collect::<Vec<_>>()
@@ -899,10 +901,11 @@ impl VulkanApp {
             vk::ImageTiling::OPTIMAL,
             vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
             vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            1,
         );
 
         let image_view =
-            Self::create_image_view(device, image, depth_format, vk::ImageAspectFlags::DEPTH);
+            Self::create_image_view(device, image, depth_format, vk::ImageAspectFlags::DEPTH, 1);
 
         (image, image_memory, image_view)
     }
@@ -966,12 +969,14 @@ impl VulkanApp {
         physical_device: vk::PhysicalDevice,
         command_pool: vk::CommandPool,
         queue: vk::Queue,
-    ) -> (vk::Image, vk::DeviceMemory) {
+    ) -> (vk::Image, vk::DeviceMemory, u32) {
         let image = image::open("textures/viking_room.png").unwrap();
         let image_as_rgb = image.to_rgba8();
         let (width, height) = (image_as_rgb.width(), image_as_rgb.height());
         let pixels = image_as_rgb.into_raw();
         let image_size = (pixels.len() * size_of::<u8>()) as vk::DeviceSize;
+        let mip_levels = (width.max(height) as f32).log2().floor() as u32 + 1;
+
         let (staging_buffer, staging_buffer_memory) = Self::create_buffer(
             instance,
             device,
@@ -1003,8 +1008,11 @@ impl VulkanApp {
             height,
             vk::Format::R8G8B8A8_SRGB,
             vk::ImageTiling::OPTIMAL,
-            vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
+            vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::TRANSFER_DST
+                | vk::ImageUsageFlags::SAMPLED,
             vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            mip_levels,
         );
 
         Self::transition_image_layout_single_time(
@@ -1014,6 +1022,7 @@ impl VulkanApp {
             texture_image,
             vk::ImageLayout::UNDEFINED,
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            mip_levels,
         );
         Self::copy_buffer_to_image(
             device,
@@ -1024,13 +1033,17 @@ impl VulkanApp {
             width,
             height,
         );
-        Self::transition_image_layout_single_time(
+        Self::generate_mipmaps(
+            instance,
             device,
+            physical_device,
             command_pool,
             queue,
             texture_image,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::Format::R8G8B8A8_SRGB,
+            width as _,
+            height as _,
+            mip_levels,
         );
 
         unsafe {
@@ -1038,15 +1051,172 @@ impl VulkanApp {
             device.destroy_buffer(staging_buffer, None);
         }
 
-        (texture_image, texture_image_memory)
+        (texture_image, texture_image_memory, mip_levels)
     }
 
-    fn create_texture_image_view(device: &Device, image: vk::Image) -> vk::ImageView {
+    fn generate_mipmaps(
+        instance: &Instance,
+        device: &Device,
+        physical_device: vk::PhysicalDevice,
+        command_pool: vk::CommandPool,
+        queue: vk::Queue,
+        image: vk::Image,
+        image_format: vk::Format,
+        width: i32,
+        height: i32,
+        mip_levels: u32,
+    ) {
+        let format_properties = unsafe {
+            instance.get_physical_device_format_properties(physical_device, image_format)
+        };
+        if !format_properties
+            .optimal_tiling_features
+            .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR)
+        {
+            panic!("texture image format does not support linear blitting!");
+        }
+
+        Self::execute_single_time_commands(device, command_pool, queue, |command_buffer| {
+            let mut image_memory_barrier = vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                });
+
+            let (mut mip_width, mut mip_height) = (width, height);
+
+            for i in 1..mip_levels {
+                image_memory_barrier.subresource_range.base_mip_level = i - 1;
+                image_memory_barrier.old_layout = vk::ImageLayout::TRANSFER_DST_OPTIMAL;
+                image_memory_barrier.new_layout = vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
+                image_memory_barrier.src_access_mask = vk::AccessFlags::TRANSFER_WRITE;
+                image_memory_barrier.dst_access_mask = vk::AccessFlags::TRANSFER_READ;
+
+                unsafe {
+                    device.cmd_pipeline_barrier(
+                        command_buffer,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[image_memory_barrier],
+                    )
+                };
+
+                let src_offsets = [
+                    vk::Offset3D::default(),
+                    vk::Offset3D {
+                        x: mip_width,
+                        y: mip_height,
+                        z: 1,
+                    },
+                ];
+                let dst_offsets = [
+                    vk::Offset3D::default(),
+                    vk::Offset3D {
+                        x: if mip_width > 1 { mip_width / 2 } else { 1 },
+                        y: if mip_height > 1 { mip_height / 2 } else { 1 },
+                        z: 1,
+                    },
+                ];
+
+                let image_blit = vk::ImageBlit::default()
+                    .src_subresource(
+                        vk::ImageSubresourceLayers::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .mip_level(i - 1)
+                            .base_array_layer(0)
+                            .layer_count(1),
+                    )
+                    .dst_subresource(
+                        vk::ImageSubresourceLayers::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .mip_level(i)
+                            .base_array_layer(0)
+                            .layer_count(1),
+                    )
+                    .src_offsets(src_offsets)
+                    .dst_offsets(dst_offsets);
+
+                unsafe {
+                    device.cmd_blit_image(
+                        command_buffer,
+                        image,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        image,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        &[image_blit],
+                        vk::Filter::LINEAR,
+                    )
+                };
+
+                image_memory_barrier.old_layout = vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
+                image_memory_barrier.new_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+                image_memory_barrier.src_access_mask = vk::AccessFlags::TRANSFER_READ;
+                image_memory_barrier.dst_access_mask = vk::AccessFlags::SHADER_READ;
+
+                unsafe {
+                    device.cmd_pipeline_barrier(
+                        command_buffer,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::FRAGMENT_SHADER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[image_memory_barrier],
+                    )
+                };
+
+                if mip_width > 1 {
+                    mip_width /= 2;
+                }
+                if mip_height > 1 {
+                    mip_height /= 2;
+                }
+            }
+
+            image_memory_barrier.subresource_range.base_mip_level = mip_levels - 1;
+            image_memory_barrier.old_layout = vk::ImageLayout::TRANSFER_DST_OPTIMAL;
+            image_memory_barrier.new_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+            image_memory_barrier.src_access_mask = vk::AccessFlags::TRANSFER_WRITE;
+            image_memory_barrier.dst_access_mask = vk::AccessFlags::SHADER_READ;
+
+            unsafe {
+                device.cmd_pipeline_barrier(
+                    command_buffer,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[image_memory_barrier],
+                )
+            };
+        });
+    }
+
+    fn create_texture_image_view(
+        device: &Device,
+        image: vk::Image,
+        mip_levels: u32,
+    ) -> vk::ImageView {
         Self::create_image_view(
             device,
             image,
             vk::Format::R8G8B8A8_SRGB,
             vk::ImageAspectFlags::COLOR,
+            mip_levels,
         )
     }
 
@@ -1090,6 +1260,7 @@ impl VulkanApp {
         tiling: vk::ImageTiling,
         usage: vk::ImageUsageFlags,
         memory_properties: vk::MemoryPropertyFlags,
+        mip_levels: u32,
     ) -> (vk::Image, vk::DeviceMemory) {
         let image_create_info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
@@ -1099,7 +1270,7 @@ impl VulkanApp {
                 height,
                 depth: 1,
             })
-            .mip_levels(1)
+            .mip_levels(mip_levels)
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(tiling)
@@ -1132,6 +1303,7 @@ impl VulkanApp {
         image: vk::Image,
         format: vk::Format,
         aspect_mask: vk::ImageAspectFlags,
+        mip_levels: u32,
     ) -> vk::ImageView {
         let image_view_create_info = vk::ImageViewCreateInfo::default()
             .image(image)
@@ -1140,7 +1312,7 @@ impl VulkanApp {
             .subresource_range(vk::ImageSubresourceRange {
                 aspect_mask,
                 base_mip_level: 0,
-                level_count: 1,
+                level_count: mip_levels,
                 base_array_layer: 0,
                 layer_count: 1,
             });
@@ -1637,6 +1809,7 @@ impl VulkanApp {
         image: vk::Image,
         old_layout: vk::ImageLayout,
         new_layout: vk::ImageLayout,
+        mip_levels: u32,
     ) {
         Self::execute_single_time_commands(device, command_pool, queue, |command_buffer| {
             let (src_access_mask, dst_access_mask, src_stage_mask, dst_stage_mask) =
@@ -1666,7 +1839,7 @@ impl VulkanApp {
                 .subresource_range(vk::ImageSubresourceRange {
                     aspect_mask: vk::ImageAspectFlags::COLOR,
                     base_mip_level: 0,
-                    level_count: 1,
+                    level_count: mip_levels,
                     base_array_layer: 0,
                     layer_count: 1,
                 })
