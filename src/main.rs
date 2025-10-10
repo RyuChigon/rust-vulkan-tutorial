@@ -113,6 +113,7 @@ struct VulkanApp {
     instance: Instance,
     debug_messenger: Option<(debug_utils::Instance, DebugUtilsMessengerEXT)>,
     physical_device: vk::PhysicalDevice,
+    msaa_samples: vk::SampleCountFlags,
     device: Device,
     graphics_index: u32,
     present_index: u32,
@@ -148,6 +149,10 @@ struct VulkanApp {
     uniform_buffers_memories: Vec<vk::DeviceMemory>,
     uniform_buffers_mapped_ptrs: Vec<*mut c_void>,
 
+    color_image: vk::Image,
+    color_image_memory: vk::DeviceMemory,
+    color_image_view: vk::ImageView,
+
     depth_image: vk::Image,
     depth_image_memory: vk::DeviceMemory,
     depth_image_view: vk::ImageView,
@@ -179,6 +184,7 @@ impl VulkanApp {
         let (surface_instance, surface_khr) = Self::create_surface(&entry, &instance, window);
 
         let physical_device = Self::pick_physical_device(&instance, &surface_instance, surface_khr);
+        let msaa_samples = Self::get_max_usable_sample_count(&instance, physical_device);
 
         let (graphics_index, present_index) =
             Self::find_queue_families(&instance, physical_device, &surface_instance, surface_khr);
@@ -214,6 +220,7 @@ impl VulkanApp {
             &swapchain_properties,
             &[descriptor_set_layout],
             depth_format,
+            msaa_samples,
         );
 
         let command_pool = Self::create_command_pool(&device, graphics_index);
@@ -243,11 +250,20 @@ impl VulkanApp {
         let (uniform_buffers, uniform_buffers_memories, uniform_buffers_mapped_ptrs) =
             Self::create_uniform_buffers(&instance, &device, physical_device, swapchain_images_len);
 
+        let (color_image, color_image_memory, color_image_view) = Self::create_color_resources(
+            &device,
+            &instance,
+            physical_device,
+            &swapchain_properties,
+            msaa_samples,
+        );
+
         let (depth_image, depth_image_memory, depth_image_view) = Self::create_depth_resources(
             &device,
             &instance,
             physical_device,
             &swapchain_properties,
+            msaa_samples,
         );
 
         let (texture_image, texture_image_memory, mip_levels) = Self::create_texture_image(
@@ -278,6 +294,7 @@ impl VulkanApp {
             instance,
             debug_messenger,
             physical_device,
+            msaa_samples,
             device,
             graphics_index,
             present_index,
@@ -311,6 +328,10 @@ impl VulkanApp {
             uniform_buffers,
             uniform_buffers_memories,
             uniform_buffers_mapped_ptrs,
+
+            color_image,
+            color_image_memory,
+            color_image_view,
 
             depth_image,
             depth_image_memory,
@@ -479,6 +500,42 @@ impl VulkanApp {
             ash::khr::create_renderpass2::NAME,
             ash::khr::portability_subset::NAME,
         ]
+    }
+
+    fn get_max_usable_sample_count(
+        instance: &Instance,
+        physical_device: vk::PhysicalDevice,
+    ) -> vk::SampleCountFlags {
+        let physical_device_properties =
+            unsafe { instance.get_physical_device_properties(physical_device) };
+
+        let counts = physical_device_properties
+            .limits
+            .framebuffer_color_sample_counts
+            & physical_device_properties
+                .limits
+                .framebuffer_depth_sample_counts;
+
+        if counts.contains(vk::SampleCountFlags::TYPE_64) {
+            return vk::SampleCountFlags::TYPE_64;
+        }
+        if counts.contains(vk::SampleCountFlags::TYPE_32) {
+            return vk::SampleCountFlags::TYPE_32;
+        }
+        if counts.contains(vk::SampleCountFlags::TYPE_16) {
+            return vk::SampleCountFlags::TYPE_16;
+        }
+        if counts.contains(vk::SampleCountFlags::TYPE_8) {
+            return vk::SampleCountFlags::TYPE_8;
+        }
+        if counts.contains(vk::SampleCountFlags::TYPE_4) {
+            return vk::SampleCountFlags::TYPE_4;
+        }
+        if counts.contains(vk::SampleCountFlags::TYPE_2) {
+            return vk::SampleCountFlags::TYPE_2;
+        }
+
+        vk::SampleCountFlags::TYPE_1
     }
 
     fn find_queue_families(
@@ -722,6 +779,7 @@ impl VulkanApp {
         swapchain_properties: &SwapchainProperties,
         descriptor_set_layouts: &[vk::DescriptorSetLayout],
         depth_format: vk::Format,
+        msaa_samples: vk::SampleCountFlags,
     ) -> (vk::Pipeline, vk::PipelineLayout) {
         let shader_code = Self::read_shader_from_file("shaders/shader.spv");
         let shader_module = Self::create_shader_module(device, &shader_code);
@@ -767,7 +825,7 @@ impl VulkanApp {
 
         // We'll revisit multisampling in later chapter
         let multisampling_info = vk::PipelineMultisampleStateCreateInfo::default()
-            .rasterization_samples(vk::SampleCountFlags::TYPE_1)
+            .rasterization_samples(msaa_samples)
             .sample_shading_enable(false);
 
         let depth_stencil_info = vk::PipelineDepthStencilStateCreateInfo::default()
@@ -883,11 +941,41 @@ impl VulkanApp {
         }
     }
 
+    fn create_color_resources(
+        device: &Device,
+        instance: &Instance,
+        physical_device: vk::PhysicalDevice,
+        swapchain_properties: &SwapchainProperties,
+        msaa_samples: vk::SampleCountFlags,
+    ) -> (vk::Image, vk::DeviceMemory, vk::ImageView) {
+        let color_format = swapchain_properties.format.format;
+
+        let (image, image_memory) = Self::create_image(
+            device,
+            instance,
+            physical_device,
+            swapchain_properties.extent.width,
+            swapchain_properties.extent.height,
+            color_format,
+            vk::ImageTiling::OPTIMAL,
+            vk::ImageUsageFlags::TRANSIENT_ATTACHMENT | vk::ImageUsageFlags::COLOR_ATTACHMENT,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            1,
+            msaa_samples,
+        );
+
+        let image_view =
+            Self::create_image_view(device, image, color_format, vk::ImageAspectFlags::COLOR, 1);
+
+        (image, image_memory, image_view)
+    }
+
     fn create_depth_resources(
         device: &Device,
         instance: &Instance,
         physical_device: vk::PhysicalDevice,
         swapchain_properties: &SwapchainProperties,
+        msaa_samples: vk::SampleCountFlags,
     ) -> (vk::Image, vk::DeviceMemory, vk::ImageView) {
         let depth_format = Self::find_depth_format(instance, physical_device);
 
@@ -902,6 +990,7 @@ impl VulkanApp {
             vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
             vk::MemoryPropertyFlags::DEVICE_LOCAL,
             1,
+            msaa_samples,
         );
 
         let image_view =
@@ -1013,6 +1102,7 @@ impl VulkanApp {
                 | vk::ImageUsageFlags::SAMPLED,
             vk::MemoryPropertyFlags::DEVICE_LOCAL,
             mip_levels,
+            vk::SampleCountFlags::TYPE_1,
         );
 
         Self::transition_image_layout_single_time(
@@ -1261,6 +1351,7 @@ impl VulkanApp {
         usage: vk::ImageUsageFlags,
         memory_properties: vk::MemoryPropertyFlags,
         mip_levels: u32,
+        num_samples: vk::SampleCountFlags,
     ) -> (vk::Image, vk::DeviceMemory) {
         let image_create_info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
@@ -1272,7 +1363,7 @@ impl VulkanApp {
             })
             .mip_levels(mip_levels)
             .array_layers(1)
-            .samples(vk::SampleCountFlags::TYPE_1)
+            .samples(num_samples)
             .tiling(tiling)
             .usage(usage)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
@@ -1654,6 +1745,8 @@ impl VulkanApp {
         pipeline_layout: vk::PipelineLayout,
         descriptor_sets: &[vk::DescriptorSet],
         current_frame: usize,
+        color_image: vk::Image,
+        color_image_view: vk::ImageView,
         depth_image: vk::Image,
         depth_image_view: vk::ImageView,
         indices: &[u32],
@@ -1674,36 +1767,36 @@ impl VulkanApp {
             vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
             vk::PipelineStageFlags2::TOP_OF_PIPE,
             vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            vk::ImageAspectFlags::COLOR,
         );
 
-        let depth_image_memory_barriers = &[vk::ImageMemoryBarrier2::default()
-            .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
-            .src_access_mask(vk::AccessFlags2::empty())
-            .dst_stage_mask(
-                vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
-                    | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-            )
-            .dst_access_mask(
-                vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ_KHR
-                    | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
-            )
-            .old_layout(vk::ImageLayout::UNDEFINED)
-            .new_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .image(depth_image)
-            .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::DEPTH,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            })];
+        // Transition the multisampled color image to COLOR_ATTACHMENT_OPTIMAL
+        Self::transition_image_layout(
+            device,
+            command_buffer,
+            color_image,
+            vk::ImageLayout::UNDEFINED,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            vk::AccessFlags2::empty(),
+            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            vk::PipelineStageFlags2::TOP_OF_PIPE,
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            vk::ImageAspectFlags::COLOR,
+        );
 
-        let depth_dependency_info =
-            vk::DependencyInfo::default().image_memory_barriers(depth_image_memory_barriers);
-
-        unsafe { device.cmd_pipeline_barrier2(command_buffer, &depth_dependency_info) };
+        // Transition the depth image to DEPTH_ATTACHMENT_OPTIMAL
+        Self::transition_image_layout(
+            device,
+            command_buffer,
+            depth_image,
+            vk::ImageLayout::UNDEFINED,
+            vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
+            vk::AccessFlags2::empty(),
+            vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            vk::PipelineStageFlags2::TOP_OF_PIPE,
+            vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS,
+            vk::ImageAspectFlags::DEPTH,
+        );
 
         let clear_color = vk::ClearValue {
             color: vk::ClearColorValue {
@@ -1718,8 +1811,12 @@ impl VulkanApp {
         };
 
         let color_attachment_info = vk::RenderingAttachmentInfo::default()
-            .image_view(swapchain_image_views[image_index])
+            .image_view(color_image_view)
             .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            // multisampled with resolve attachment
+            .resolve_mode(vk::ResolveModeFlags::AVERAGE)
+            .resolve_image_view(swapchain_image_views[image_index])
+            .resolve_image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
             .load_op(vk::AttachmentLoadOp::CLEAR)
             .store_op(vk::AttachmentStoreOp::STORE)
             .clear_value(clear_color);
@@ -1797,6 +1894,7 @@ impl VulkanApp {
             vk::AccessFlags2::default(),
             vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
             vk::PipelineStageFlags2::BOTTOM_OF_PIPE,
+            vk::ImageAspectFlags::COLOR,
         );
 
         unsafe { device.end_command_buffer(command_buffer).unwrap() }
@@ -1870,6 +1968,7 @@ impl VulkanApp {
         dst_access_mask: vk::AccessFlags2,
         src_stage_mask: vk::PipelineStageFlags2,
         dst_stage_mask: vk::PipelineStageFlags2,
+        aspect_mask: vk::ImageAspectFlags,
     ) {
         let image_memory_barrier = vk::ImageMemoryBarrier2::default()
             .old_layout(old_layout)
@@ -1882,7 +1981,7 @@ impl VulkanApp {
             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .image(image)
             .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
+                aspect_mask,
                 base_mip_level: 0,
                 level_count: 1,
                 base_array_layer: 0,
@@ -2044,6 +2143,8 @@ impl VulkanApp {
             self.pipeline_layout,
             &self.descriptor_sets,
             self.current_frame,
+            self.color_image,
+            self.color_image_view,
             self.depth_image,
             self.depth_image_view,
             &self.indices,
@@ -2219,11 +2320,20 @@ impl VulkanApp {
             &swapchain_properties,
         );
 
+        let (color_image, color_image_memory, color_image_view) = Self::create_color_resources(
+            &self.device,
+            &self.instance,
+            self.physical_device,
+            &swapchain_properties,
+            self.msaa_samples,
+        );
+
         let (depth_image, depth_image_memory, depth_image_view) = Self::create_depth_resources(
             &self.device,
             &self.instance,
             self.physical_device,
             &swapchain_properties,
+            self.msaa_samples,
         );
 
         self.swapchain_device = swapchain_device;
@@ -2231,6 +2341,10 @@ impl VulkanApp {
         self.swapchain_images = swapchain_images;
         self.swapchain_properties = swapchain_properties;
         self.swapchain_image_views = swapchain_image_views;
+
+        self.color_image = color_image;
+        self.color_image_memory = color_image_memory;
+        self.color_image_view = color_image_view;
 
         self.depth_image = depth_image;
         self.depth_image_memory = depth_image_memory;
@@ -2242,6 +2356,10 @@ impl VulkanApp {
             self.device.destroy_image_view(self.depth_image_view, None);
             self.device.free_memory(self.depth_image_memory, None);
             self.device.destroy_image(self.depth_image, None);
+
+            self.device.destroy_image_view(self.color_image_view, None);
+            self.device.free_memory(self.color_image_memory, None);
+            self.device.destroy_image(self.color_image, None);
 
             self.swapchain_image_views
                 .iter()
