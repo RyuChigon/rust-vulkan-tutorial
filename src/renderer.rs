@@ -10,7 +10,7 @@ use ash::{
     ext::debug_utils,
     vk::{self, DebugUtilsMessengerEXT},
 };
-use cgmath::{Deg, Matrix4, Point3, Vector3};
+use cgmath::{Deg, Matrix4, Point3, Vector3, Vector4};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::window::Window;
 
@@ -601,7 +601,7 @@ impl Renderer {
                 .binding(0)
                 .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                 .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::VERTEX),
+                .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT),
             vk::DescriptorSetLayoutBinding::default()
                 .binding(1)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
@@ -2084,7 +2084,13 @@ impl Renderer {
         );
         let proj = math::perspective(Deg(45.0), aspect, 0.1, 10.0);
 
-        let ubos = [UniformBufferObject { view, proj }];
+        let ubos = [UniformBufferObject {
+            view,
+            proj,
+            light_position: Vector4::new(2.0, 2.0, 2.0, 1.0),
+            light_color: Vector4::new(0.0, 1.0, 0.0, 0.0),
+            view_position: Vector4::new(2.0, 2.0, 2.0, 1.0),
+        }];
 
         let mapped_ptr = self.uniform_buffers_mapped_ptrs[current_image];
         let mut align = unsafe {
@@ -2309,4 +2315,7 @@ impl SyncObjects {
 struct UniformBufferObject {
     view: Matrix4<f32>,
     proj: Matrix4<f32>,
+    light_position: Vector4<f32>,
+    light_color: Vector4<f32>,
+    view_position: Vector4<f32>,
 }

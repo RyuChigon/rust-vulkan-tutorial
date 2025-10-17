@@ -10,6 +10,7 @@ pub struct Vertex {
     pub pos: [f32; 3],
     pub color: [f32; 3],
     pub tex_coord: [f32; 2],
+    pub normal: [f32; 3],
 }
 
 impl Vertex {
@@ -20,7 +21,7 @@ impl Vertex {
             .input_rate(vk::VertexInputRate::VERTEX)
     }
 
-    pub fn get_attribute_descriptions() -> [vk::VertexInputAttributeDescription; 3] {
+    pub fn get_attribute_descriptions() -> [vk::VertexInputAttributeDescription; 4] {
         [
             vk::VertexInputAttributeDescription::default()
                 .location(0)
@@ -37,13 +38,21 @@ impl Vertex {
                 .binding(0)
                 .format(vk::Format::R32G32_SFLOAT)
                 .offset(offset_of!(Vertex, tex_coord) as _),
+            vk::VertexInputAttributeDescription::default()
+                .location(3)
+                .binding(0)
+                .format(vk::Format::R32G32B32_SFLOAT)
+                .offset(offset_of!(Vertex, normal) as _),
         ]
     }
 }
 
 impl PartialEq for Vertex {
     fn eq(&self, other: &Self) -> bool {
-        self.pos == other.pos && self.color == other.color && self.tex_coord == other.tex_coord
+        self.pos == other.pos
+            && self.color == other.color
+            && self.tex_coord == other.tex_coord
+            && self.normal == other.normal
     }
 }
 
@@ -59,5 +68,8 @@ impl Hash for Vertex {
         self.color[2].to_bits().hash(state);
         self.tex_coord[0].to_bits().hash(state);
         self.tex_coord[1].to_bits().hash(state);
+        self.normal[0].to_bits().hash(state);
+        self.normal[1].to_bits().hash(state);
+        self.normal[2].to_bits().hash(state);
     }
 }
